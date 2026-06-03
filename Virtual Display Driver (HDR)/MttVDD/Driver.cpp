@@ -39,6 +39,8 @@ Environment:
 #include <cwchar>
 #include <map>
 #include <set>
+#include <atomic>
+#include <thread>
 
 
 
@@ -53,6 +55,29 @@ HANDLE hPipeThread = NULL;
 bool g_Running = true;
 mutex g_Mutex;
 HANDLE g_pipeHandle = INVALID_HANDLE_VALUE;
+
+// ============================================================================
+// On-demand monitor management (spacedesk-style: idle at 0, add/remove ONE by index)
+// ============================================================================
+//
+// The pipe thread runs outside any WDF/IddCx callback, so it has no WDFOBJECT to feed
+// WdfObjectGet_IndirectDeviceContextWrapper(). We cache the live device context here when
+// the adapter is initialized (InitAdapter). This replaces the old ReloadDriver() which
+// incorrectly passed a pipe HANDLE to WdfObjectGet_IndirectDeviceContextWrapper() (a
+// WDFOBJECT type-confusion bug). Guarded by g_DeviceContextMutex.
+namespace Microsoft { namespace IndirectDisp { class IndirectDeviceContext; } }
+Microsoft::IndirectDisp::IndirectDeviceContext* g_DeviceContext = nullptr;
+std::mutex g_DeviceContextMutex;
+
+// Watchdog (parsec-vdd / SudoVDA self-healing). If the broker stops PINGing for
+// g_WatchdogTimeoutSeconds, every live monitor is auto-removed so a crashed broker can't
+// leave orphan displays attached. Set g_WatchdogTimeoutSeconds to 0 to disable.
+// Runtime variable (not constexpr) so the disable check is a real branch (avoids C4127 under /WX)
+// and so a future registry/config knob can adjust it without a rebuild.
+int               g_WatchdogTimeoutSeconds = 3;
+std::atomic<int>  g_WatchdogCountdown{ 0 };   // seconds remaining before "bark"; reset on every PING/command
+std::atomic<bool> g_WatchdogRunning{ false };
+HANDLE            g_WatchdogThread = NULL;
 
 using namespace std;
 using namespace Microsoft::IndirectDisp;
@@ -714,6 +739,9 @@ struct VddGammaRamp {
 
 // === GAMMA AND COLOR SPACE STORAGE ===
 std::map<IDDCX_MONITOR, VddGammaRamp> g_GammaRampStore;
+// Guards g_GammaRampStore. The store is read/written from IddCx gamma callbacks AND erased from
+// the pipe/watchdog thread in RemoveMonitor, so cross-thread access must be serialized.
+std::mutex g_GammaRampStoreMutex;
 
 // === COLOR SPACE AND GAMMA CONVERSION FUNCTIONS ===
 
@@ -865,6 +893,8 @@ struct VddHdrMetadata {
 
 // === HDR METADATA STORAGE ===
 std::map<IDDCX_MONITOR, VddHdrMetadata> g_HdrMetadataStore;
+// Guards g_HdrMetadataStore (see g_GammaRampStoreMutex rationale).
+std::mutex g_HdrMetadataStoreMutex;
 
 // === HDR METADATA CONVERSION FUNCTIONS ===
 
@@ -2050,12 +2080,78 @@ void logAvailableGPUs() {
 
 
 
-void ReloadDriver(HANDLE hPipe) {
-	auto* pContext = WdfObjectGet_IndirectDeviceContextWrapper(hPipe);
-	if (pContext && pContext->pContext) {
-		pContext->pContext->InitAdapter();
-		vddlog("i", "Adapter reinitialized");
+// Return the live device context cached by InitAdapter, or nullptr if the adapter isn't up yet.
+// This replaces the old ReloadDriver(HANDLE) which fed a pipe HANDLE to
+// WdfObjectGet_IndirectDeviceContextWrapper (a WDFOBJECT) — a type-confusion bug that could
+// dereference garbage. The pipe thread now reaches the context safely through this cache.
+static Microsoft::IndirectDisp::IndirectDeviceContext* GetDeviceContext() {
+	std::lock_guard<std::mutex> lk(g_DeviceContextMutex);
+	return g_DeviceContext;
+}
+
+// Reset the watchdog countdown (broker is alive). Called on every inbound command.
+static void WatchdogKick() {
+	if (g_WatchdogTimeoutSeconds > 0) {
+		g_WatchdogCountdown.store(g_WatchdogTimeoutSeconds, std::memory_order_relaxed);
 	}
+}
+
+// Watchdog body: once per second decrement the countdown; on reaching 0 (broker went silent)
+// remove every live monitor so a crashed/disconnected broker can't leave orphan displays.
+// Mirrors parsec-vdd / SudoVDA self-healing.
+static DWORD WINAPI WatchdogProc(LPVOID) {
+	while (g_WatchdogRunning.load(std::memory_order_relaxed)) {
+		Sleep(1000);
+		if (!g_WatchdogRunning.load(std::memory_order_relaxed)) break;
+		if (g_WatchdogTimeoutSeconds <= 0) continue;
+
+		int c = g_WatchdogCountdown.load(std::memory_order_relaxed);
+		if (c <= 0) {
+			// Already barked (or never armed). Only bark again if monitors are live.
+			auto* ctx = GetDeviceContext();
+			if (ctx && ctx->LiveMonitorCount() > 0) {
+				vddlog("w", "Watchdog: no PING from broker; removing all monitors (self-heal).");
+				ctx->RemoveAllMonitors();
+			}
+			continue;
+		}
+		g_WatchdogCountdown.store(c - 1, std::memory_order_relaxed);
+	}
+	return 0;
+}
+
+static void StartWatchdog() {
+	if (g_WatchdogTimeoutSeconds <= 0) {
+		vddlog("i", "Watchdog disabled (g_WatchdogTimeoutSeconds == 0).");
+		return;
+	}
+	if (g_WatchdogRunning.exchange(true)) return; // already running
+	g_WatchdogCountdown.store(g_WatchdogTimeoutSeconds, std::memory_order_relaxed);
+	g_WatchdogThread = CreateThread(NULL, 0, WatchdogProc, NULL, 0, NULL);
+	if (g_WatchdogThread == NULL) {
+		g_WatchdogRunning.store(false);
+		vddlog("e", "Failed to start watchdog thread.");
+	} else {
+		vddlog("i", "Watchdog started.");
+	}
+}
+
+static void StopWatchdog() {
+	if (!g_WatchdogRunning.exchange(false)) return;
+	if (g_WatchdogThread) {
+		WaitForSingleObject(g_WatchdogThread, 2000);
+		CloseHandle(g_WatchdogThread);
+		g_WatchdogThread = NULL;
+	}
+	vddlog("i", "Watchdog stopped.");
+}
+
+// Legacy compatibility shim. The on-demand model never reloads the adapter; settings that used to
+// trigger a full reinit (HDR+/SDR10/EDID/GPU toggles) now just log. The adapter stays up and the
+// new EDID/caps take effect on the next AddMonitor. Kept as a no-op so the many existing call
+// sites still compile without sprinkling #ifdefs.
+void ReloadDriver(HANDLE /*hPipe*/) {
+	vddlog("i", "ReloadDriver is a no-op under the on-demand model; setting will apply on next AddMonitor.");
 }
 
 
@@ -2219,8 +2315,71 @@ void HandleClient(HANDLE hPipe) {
 			}
 			ReloadDriver(hPipe);
 		}
+		// ===== On-demand monitor control (CONTRACT — the Rust broker codes to this) =====
+		// "ADD"            -> add ONE monitor at the lowest free connector index; the chosen
+		//                     index is written back to the pipe client as a UTF-16 integer string.
+		// "REMOVE <index>" -> remove the monitor at <index>.
+		// Both kick the watchdog. Must be checked BEFORE the legacy "SETDISPLAYCOUNT" handling.
+		else if (wcsncmp(buffer, L"ADD", 3) == 0 &&
+		         (buffer[3] == L'\0' || buffer[3] == L'\r' || buffer[3] == L'\n' || buffer[3] == L' ')) {
+			WatchdogKick();
+			auto* ctx = GetDeviceContext();
+			if (!ctx) {
+				vddlog("e", "ADD failed: device context not ready (adapter not initialized).");
+				SendToPipe("ERR");
+			}
+			else {
+				int idx = ctx->LowestFreeIndex();
+				if (idx < 0) {
+					vddlog("e", "ADD failed: no free connector index (MAX_MONITORS reached).");
+					SendToPipe("ERR");
+				}
+				else if (!ctx->AddMonitor(static_cast<UINT>(idx))) {
+					vddlog("e", "ADD failed: AddMonitor returned false.");
+					SendToPipe("ERR");
+				}
+				else {
+					// Write the chosen index back to the broker as an ASCII integer string
+					// (same channel/encoding as PONG/OK/ERR via SendToPipe, so the broker
+					// parses every on-demand reply uniformly as ASCII).
+					std::string reply = std::to_string(idx);
+					SendToPipe(reply);
+					vddlog("i", ("ADD -> index " + reply).c_str());
+				}
+			}
+		}
+		else if (wcsncmp(buffer, L"REMOVE", 6) == 0) {
+			WatchdogKick();
+			int index = -1;
+			// Accept "REMOVE 3", "REMOVE  3", etc. swscanf_s tolerates leading spaces.
+			if (swscanf_s(buffer + 6, L"%d", &index) == 1 && index >= 0) {
+				auto* ctx = GetDeviceContext();
+				if (!ctx) {
+					vddlog("e", "REMOVE failed: device context not ready.");
+					SendToPipe("ERR");
+				}
+				else if (ctx->RemoveMonitor(static_cast<UINT>(index))) {
+					std::wstring lg = L"REMOVE index " + std::to_wstring(index) + L" -> OK";
+					vddlog("i", WStringToString(lg).c_str());
+					SendToPipe("OK");
+				}
+				else {
+					std::wstring lg = L"REMOVE index " + std::to_wstring(index) + L" -> not live";
+					vddlog("w", WStringToString(lg).c_str());
+					SendToPipe("ERR");
+				}
+			}
+			else {
+				vddlog("e", "REMOVE failed: missing/invalid index. Usage: REMOVE <index>");
+				SendToPipe("ERR");
+			}
+		}
+		// Legacy fixed-count command. Under the on-demand model this no longer reloads the
+		// adapter; it only persists the configured count (used as a preconnect hint at next
+		// adapter init). Kept for backward compatibility with old tooling.
 		else if (wcsncmp(buffer, L"SETDISPLAYCOUNT", 15) == 0) {
-			vddlog("i", "Setting Display Count");
+			WatchdogKick();
+			vddlog("i", "Setting Display Count (persisted; on-demand model does not reload)");
 
 			int newDisplayCount = 1;
 			swscanf_s(buffer + 15, L"%d", &newDisplayCount);
@@ -2229,12 +2388,11 @@ void HandleClient(HANDLE hPipe) {
 			vddlog("c", WStringToString(displayLog).c_str());
 
 			if (UpdateXmlDisplayCountSetting(newDisplayCount)){
-				vddlog("c", "Display Count Changed, Restarting Driver");
+				vddlog("c", "Display Count persisted to XML.");
 			}
 			else {
-				vddlog("e", "Failed to update display count setting in XML. Restarting anyway");
+				vddlog("e", "Failed to update display count setting in XML.");
 			}
-			ReloadDriver(hPipe);
 		}
 		else if (wcsncmp(buffer, L"GETSETTINGS", 11) == 0) {
 			//query and return settings
@@ -2251,6 +2409,8 @@ void HandleClient(HANDLE hPipe) {
 
 		}
 		else if (wcsncmp(buffer, L"PING", 4) == 0) {
+			// Watchdog keepalive: reset the countdown and reply PONG (CONTRACT).
+			WatchdogKick();
 			SendToPipe("PONG");
 			vddlog("p", "Heartbeat Ping");
 		}
@@ -2276,8 +2436,11 @@ DWORD WINAPI NamedPipeServer(LPVOID lpParam) {
 	SECURITY_ATTRIBUTES sa;
 	sa.nLength = sizeof(SECURITY_ATTRIBUTES);
 	sa.bInheritHandle = FALSE;
-	const wchar_t* sddl = L"D:(A;;GA;;;WD)";
-	vddlog("d", "Starting pipe with parameters: D:(A;;GA;;;WD)");
+	// Tightened from D:(A;;GA;;;WD) (Everyone/World had full access) to SYSTEM + Administrators
+	// only. Only the SYSTEM broker drives this pipe, so no other principal needs access. This
+	// prevents any unprivileged process from issuing ADD/REMOVE and conjuring/destroying displays.
+	const wchar_t* sddl = L"D:(A;;GA;;;SY)(A;;GA;;;BA)";
+	vddlog("d", "Starting pipe with parameters: D:(A;;GA;;;SY)(A;;GA;;;BA)");
 	if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
 		sddl, SDDL_REVISION_1, &sa.lpSecurityDescriptor, NULL)) {
 		DWORD ErrorCode = GetLastError();
@@ -2328,10 +2491,13 @@ void StartNamedPipeServer() {
 	else {
 		vddlog("p", "Pipe created");
 	}
+	// Start the broker-liveness watchdog alongside the pipe server.
+	StartWatchdog();
 }
 
 void StopNamedPipeServer() {
 	vddlog("p", "Stopping Pipe");
+	StopWatchdog();
 	{
 		lock_guard<mutex> lock(g_Mutex);
 		g_Running = false;
@@ -2598,9 +2764,14 @@ void loadSettings() {
 				}
 				if (currentElement == L"count") {
 					monitorcount = stoi(wstring(pwszValue, cwchValue));
-					if (monitorcount == 0) {
-						monitorcount = 1;
-						vddlog("i", "Loading singular monitor (Monitor Count is not valid)");
+					// Idle-at-0: a count of 0 is now VALID and means "start with no monitors;
+					// the broker will ADD them on demand". Previously this was forced to 1.
+					if (monitorcount < 0) {
+						monitorcount = 0;
+						vddlog("w", "Negative monitor count in config; clamped to 0 (idle).");
+					}
+					else if (monitorcount == 0) {
+						vddlog("i", "Monitor count is 0: adapter will idle with no monitors (on-demand).");
 					}
 				}
 				else if (currentElement == L"friendlyname") {
@@ -3652,9 +3823,7 @@ void IndirectDeviceContext::CleanupExpiredDevices()
 
 IndirectDeviceContext::IndirectDeviceContext(_In_ WDFDEVICE WdfDevice) :
 	m_WdfDevice(WdfDevice),
-	m_Adapter(nullptr),
-	m_Monitor(nullptr),
-	m_Monitor2(nullptr)
+	m_Adapter(nullptr)
 {
 	// Initialize Phase 5: Final Integration and Testing
 	NTSTATUS initStatus = InitializePhase5Integration();
@@ -3670,6 +3839,20 @@ IndirectDeviceContext::~IndirectDeviceContext()
 
 	logStream << "Destroying IndirectDeviceContext. Releasing per-monitor processing threads.";
 	vddlog("d", logStream.str().c_str());
+
+	// Drop the cached pointer first so the pipe/watchdog thread can no longer reach a
+	// context that is being torn down.
+	{
+		std::lock_guard<std::mutex> lk(g_DeviceContextMutex);
+		if (g_DeviceContext == this) {
+			g_DeviceContext = nullptr;
+		}
+	}
+
+	// Depart any monitors still attached so the OS doesn't keep orphan targets.
+	// RemoveAllMonitors takes only m_MonitorsMutex internally and releases it before each
+	// IddCxMonitorDeparture, so it is safe to call here.
+	RemoveAllMonitors();
 
 	{
 		std::lock_guard<std::mutex> lock(m_ProcessingThreadsMutex);
@@ -3707,8 +3890,20 @@ void IndirectDeviceContext::InitAdapter()
 		logStream << "FP16 processing capability detected.";
 	}
 
-	// Declare basic feature support for the adapter (required)
-	AdapterCaps.MaxMonitorsSupported = numVirtualDisplays;
+	// Tier-1: advertise that every target mode we report is monitor-compatible. This lets us
+	// hand Windows the EXACT tablet panel resolution (e.g. a non-standard 2K aspect) without it
+	// being filtered out as an "incompatible" target mode. Guarded by availability so older
+	// IddCx headers still compile.
+#ifdef IDDCX_ADAPTER_FLAGS_ALL_TARGET_MODES_MONITOR_COMPATIBLE
+	AdapterCaps.Flags |= IDDCX_ADAPTER_FLAGS_ALL_TARGET_MODES_MONITOR_COMPATIBLE;
+#endif
+
+	// Declare basic feature support for the adapter (required).
+	// Decoupled from numVirtualDisplays so the adapter idles at 0 monitors and supports adding/
+	// removing ONE monitor per connector index at runtime (idle-at-0). MaxMonitorsSupported is a
+	// FIXED upper bound and must not change across the adapter's lifetime, so we advertise the
+	// constant ceiling regardless of how many monitors are currently live.
+	AdapterCaps.MaxMonitorsSupported = MAX_MONITORS;
 	AdapterCaps.EndPointDiagnostics.Size = sizeof(AdapterCaps.EndPointDiagnostics);
 	AdapterCaps.EndPointDiagnostics.GammaSupport = IDDCX_FEATURE_IMPLEMENTATION_NONE;
 	AdapterCaps.EndPointDiagnostics.TransmissionType = IDDCX_TRANSMISSION_TYPE_WIRED_OTHER;
@@ -3765,6 +3960,14 @@ void IndirectDeviceContext::InitAdapter()
 		// Store the device context object into the WDF object context
 		auto* pContext = WdfObjectGet_IndirectDeviceContextWrapper(AdapterInitOut.AdapterObject);
 		pContext->pContext = this;
+
+		// Cache for the pipe thread so it can reach this context without a WDFOBJECT
+		// (fixes the ReloadDriver type-confusion bug where a pipe HANDLE was passed to
+		// WdfObjectGet_IndirectDeviceContextWrapper).
+		{
+			std::lock_guard<std::mutex> lk(g_DeviceContextMutex);
+			g_DeviceContext = this;
+		}
 	}
 	else {
 		logStream << "Failed to initialize adapter. Status: " << Status;
@@ -3776,23 +3979,56 @@ void IndirectDeviceContext::FinishInit()
 {
 	Options.Adapter.apply(m_Adapter);
 	vddlog("i", "Applied Adapter configs.");
-	for (unsigned int i = 0; i < numVirtualDisplays; i++) {
-		CreateMonitor(i);
+
+	// Idle-at-0: do NOT create any monitors at adapter init. Monitors are added on demand by
+	// the broker via the pipe "ADD" command (AddMonitor). This is the spacedesk model: the
+	// adapter exists with zero attached displays until a client asks for one.
+	//
+	// numVirtualDisplays is now treated as a "preconnect" count for compatibility with the
+	// legacy fixed-count behavior: if a config explicitly requests N>0 displays we honor it by
+	// pre-adding N monitors here. With idle-at-0 the broker normally leaves this at 0.
+	if (numVirtualDisplays > 0) {
+		const UINT preconnect = (numVirtualDisplays > MAX_MONITORS) ? MAX_MONITORS : numVirtualDisplays;
+		stringstream ss;
+		ss << "Pre-connecting " << preconnect << " monitor(s) per configured display count.";
+		vddlog("i", ss.str().c_str());
+		for (UINT i = 0; i < preconnect; i++) {
+			AddMonitor(i);
+		}
+	}
+	else {
+		vddlog("i", "Adapter initialized idle (0 monitors). Awaiting ADD via pipe.");
 	}
 }
 
-void IndirectDeviceContext::CreateMonitor(unsigned int index) {
-	wstring logMessage = L"Creating Monitor: " + to_wstring(index + 1);
-	string narrowLogMessage = WStringToString(logMessage);
-	vddlog("i", narrowLogMessage.c_str());
+// Build a STABLE per-connector container ID GUID. Windows uses the container ID to remember a
+// monitor's position/layout across plug cycles, so the same connector index must always map to
+// the same GUID (otherwise the OS treats every re-add as a brand-new display and forgets the
+// tablet's arrangement). We namespace the GUID with the adapter/host so it's stable but distinct.
+// TODO (Tier-1): derive this from a per-tablet stable identity (e.g. the device serial the broker
+// passes) once the ADD command carries one, so multiple tablets keep separate remembered layouts.
+static GUID MakeStableContainerId(UINT index)
+{
+	GUID g = {};
+	// Fixed namespace base ("MTT virtual display"). Only Data1 varies by connector index, which
+	// keeps each index's container ID stable across add/remove cycles within this host.
+	g.Data1 = 0x4d54'5644u ^ index;   // 'MTVD' xor index
+	g.Data2 = 0x0001;
+	g.Data3 = 0x4000;                 // RFC4122 version-4 nibble for well-formedness
+	const BYTE base[8] = { 0x8a, 0x00, 0x53, 0x55, 0x44, 0x4f, 0x56, 0x44 }; // ...SUDOVD
+	memcpy(g.Data4, base, sizeof(base));
+	g.Data4[1] = static_cast<BYTE>(index & 0xFF);
+	return g;
+}
 
-	// ==============================
-	// TODO: In a real driver, the EDID should be retrieved dynamically from a connected physical monitor. The EDID
-	// provided here is purely for demonstration, as it describes only 640x480 @ 60 Hz and 800x600 @ 60 Hz. Monitor
-	// manufacturers are required to correctly fill in physical monitor attributes in order to allow the OS to optimize
-	// settings like viewing distance and scale factor. Manufacturers should also use a unique serial number every
-	// single device to ensure the OS can tell the monitors apart.
-	// ==============================
+// Internal: build the EDID-described monitor, create it, and report arrival. Returns the created
+// IDDCX_MONITOR handle on success, or nullptr on failure. Does NOT touch m_Monitors / locks — the
+// caller (AddMonitor) owns the bookkeeping. Must be called WITHOUT m_MonitorsMutex held during the
+// IddCx calls (this function holds no locks itself).
+IDDCX_MONITOR IndirectDeviceContext::CreateMonitorObject(UINT index)
+{
+	wstring logMessage = L"Creating Monitor at connector index " + to_wstring(index);
+	vddlog("i", WStringToString(logMessage).c_str());
 
 	WDF_OBJECT_ATTRIBUTES Attr;
 	WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&Attr, IndirectDeviceContextWrapper);
@@ -3803,74 +4039,197 @@ void IndirectDeviceContext::CreateMonitor(unsigned int index) {
 	MonitorInfo.ConnectorIndex = index;
 	MonitorInfo.MonitorDescription.Size = sizeof(MonitorInfo.MonitorDescription);
 	MonitorInfo.MonitorDescription.Type = IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
-	//MonitorInfo.MonitorDescription.DataSize = sizeof(s_KnownMonitorEdid);        can no longer use size of as converted to vector
 	if (s_KnownMonitorEdid.size() > UINT_MAX)
 	{
 		vddlog("e", "Edid size passes UINT_Max, escape to prevent loading borked display");
+		return nullptr;
 	}
-	else
-	{
-		MonitorInfo.MonitorDescription.DataSize = static_cast<UINT>(s_KnownMonitorEdid.size());
-	}
-	//MonitorInfo.MonitorDescription.pData = const_cast<BYTE*>(s_KnownMonitorEdid);
-	// Changed from using const_cast to data() to safely access the EDID data.
-	// This improves type safety and code readability, as it eliminates the need for casting 
-	// and ensures we are directly working with the underlying container of known monitor EDID data.
+	MonitorInfo.MonitorDescription.DataSize = static_cast<UINT>(s_KnownMonitorEdid.size());
 	MonitorInfo.MonitorDescription.pData = IndirectDeviceContext::s_KnownMonitorEdid.data();
 
-
-
-
-
-
-	// ==============================
-	// TODO: The monitor's container ID should be distinct from "this" device's container ID if the monitor is not
-	// permanently attached to the display adapter device object. The container ID is typically made unique for each
-	// monitor and can be used to associate the monitor with other devices, like audio or input devices. In this
-	// sample we generate a random container ID GUID, but it's best practice to choose a stable container ID for a
-	// unique monitor or to use "this" device's container ID for a permanent/integrated monitor.
-	// ==============================
-
-	// Create a container ID
-	CoCreateGuid(&MonitorInfo.MonitorContainerId);
-	vddlog("d", "Created container ID");
+	// Stable container ID per connector index so Windows remembers each tablet's layout
+	// (was CoCreateGuid -> random every plug, which lost the remembered arrangement).
+	MonitorInfo.MonitorContainerId = MakeStableContainerId(index);
+	vddlog("d", "Assigned stable container ID");
 
 	IDARG_IN_MONITORCREATE MonitorCreate = {};
 	MonitorCreate.ObjectAttributes = &Attr;
 	MonitorCreate.pMonitorInfo = &MonitorInfo;
 
-	// Create a monitor object with the specified monitor descriptor
 	IDARG_OUT_MONITORCREATE MonitorCreateOut;
 	NTSTATUS Status = IddCxMonitorCreate(m_Adapter, &MonitorCreate, &MonitorCreateOut);
-	if (NT_SUCCESS(Status))
-	{
-		vddlog("d", "Monitor created successfully.");
-		m_Monitor = MonitorCreateOut.MonitorObject;
-
-		// Associate the monitor with this device context
-		auto* pContext = WdfObjectGet_IndirectDeviceContextWrapper(MonitorCreateOut.MonitorObject);
-		pContext->pContext = this;
-
-		// Tell the OS that the monitor has been plugged in
-		IDARG_OUT_MONITORARRIVAL ArrivalOut;
-		Status = IddCxMonitorArrival(m_Monitor, &ArrivalOut);
-		if (NT_SUCCESS(Status))
-		{
-			vddlog("d", "Monitor arrival successfully reported.");
-		}
-		else
-		{
-			stringstream ss;
-			ss << "Failed to report monitor arrival. Status: " << Status;
-			vddlog("e", ss.str().c_str());
-		}
-	}
-	else
+	if (!NT_SUCCESS(Status))
 	{
 		stringstream ss;
 		ss << "Failed to create monitor. Status: " << Status;
 		vddlog("e", ss.str().c_str());
+		return nullptr;
 	}
+
+	vddlog("d", "Monitor created successfully.");
+
+	// Associate the monitor with this device context
+	auto* pContext = WdfObjectGet_IndirectDeviceContextWrapper(MonitorCreateOut.MonitorObject);
+	pContext->pContext = this;
+
+	// Tell the OS that the monitor has been plugged in
+	IDARG_OUT_MONITORARRIVAL ArrivalOut;
+	Status = IddCxMonitorArrival(MonitorCreateOut.MonitorObject, &ArrivalOut);
+	if (NT_SUCCESS(Status))
+	{
+		vddlog("d", "Monitor arrival successfully reported.");
+	}
+	else
+	{
+		stringstream ss;
+		ss << "Failed to report monitor arrival. Status: " << Status;
+		vddlog("e", ss.str().c_str());
+		// Arrival failed: tear down the orphan monitor object so we don't leak a half-created
+		// target. Departure is safe here because no lock is held.
+		IddCxMonitorDeparture(MonitorCreateOut.MonitorObject);
+		return nullptr;
+	}
+
+	return MonitorCreateOut.MonitorObject;
+}
+
+// Legacy shim: old code paths call CreateMonitor(index). Route them through AddMonitor so the
+// index map stays authoritative.
+void IndirectDeviceContext::CreateMonitor(unsigned int index)
+{
+	AddMonitor(static_cast<UINT>(index));
+}
+
+// ===== On-demand add =====
+bool IndirectDeviceContext::AddMonitor(UINT index)
+{
+	if (index >= MAX_MONITORS) {
+		stringstream ss;
+		ss << "AddMonitor rejected: index " << index << " >= MAX_MONITORS (" << MAX_MONITORS << ").";
+		vddlog("e", ss.str().c_str());
+		return false;
+	}
+
+	// Reject if this connector index is already live. We check under the lock, then RELEASE the
+	// lock before the IddCx calls (IddCxMonitorCreate/Arrival can re-enter driver callbacks).
+	{
+		std::lock_guard<std::mutex> lock(m_MonitorsMutex);
+		if (m_Monitors.find(index) != m_Monitors.end()) {
+			stringstream ss;
+			ss << "AddMonitor rejected: index " << index << " is already live.";
+			vddlog("w", ss.str().c_str());
+			return false;
+		}
+	}
+
+	IDDCX_MONITOR handle = CreateMonitorObject(index);
+	if (handle == nullptr) {
+		return false;
+	}
+
+	// Commit to the map. Guard against a race where another caller grabbed the same index while
+	// we were creating (shouldn't happen with a single broker, but be safe): if the slot got
+	// taken, depart our just-created monitor OUTSIDE the lock.
+	bool raced = false;
+	{
+		std::lock_guard<std::mutex> lock(m_MonitorsMutex);
+		if (m_Monitors.find(index) != m_Monitors.end()) {
+			raced = true;
+		} else {
+			m_Monitors[index] = handle;
+		}
+	}
+	if (raced) {
+		vddlog("w", "AddMonitor lost a race for the index; departing the duplicate monitor.");
+		IddCxMonitorDeparture(handle);   // lock NOT held here
+		return false;
+	}
+
+	stringstream ss;
+	ss << "Monitor added at index " << index << ". Live count: " << LiveMonitorCount();
+	vddlog("i", ss.str().c_str());
+	return true;
+}
+
+// ===== On-demand remove =====
+bool IndirectDeviceContext::RemoveMonitor(UINT index)
+{
+	IDDCX_MONITOR handle = nullptr;
+
+	// Fetch + erase from the index map under the lock, then UNLOCK before departing.
+	// CRITICAL: IddCxMonitorDeparture may synchronously call UnassignSwapChain, which takes
+	// m_ProcessingThreadsMutex. Holding m_MonitorsMutex across departure is fine for THAT lock,
+	// but to keep the rule simple and future-proof (and to avoid ever nesting departure inside
+	// any of our locks) we always release first.
+	{
+		std::lock_guard<std::mutex> lock(m_MonitorsMutex);
+		auto it = m_Monitors.find(index);
+		if (it == m_Monitors.end()) {
+			stringstream ss;
+			ss << "RemoveMonitor: index " << index << " is not live.";
+			vddlog("w", ss.str().c_str());
+			return false;
+		}
+		handle = it->second;
+		m_Monitors.erase(it);
+	}
+
+	// Depart with NO lock held (see lock-discipline note above).
+	IddCxMonitorDeparture(handle);
+
+	// Purge per-monitor side tables keyed by the (now departed) handle so they don't leak.
+	{
+		std::lock_guard<std::mutex> hdrLock(g_HdrMetadataStoreMutex);
+		g_HdrMetadataStore.erase(handle);
+	}
+	{
+		std::lock_guard<std::mutex> gammaLock(g_GammaRampStoreMutex);
+		g_GammaRampStore.erase(handle);
+	}
+
+	stringstream ss;
+	ss << "Monitor removed at index " << index << ". Live count: " << LiveMonitorCount();
+	vddlog("i", ss.str().c_str());
+	return true;
+}
+
+void IndirectDeviceContext::RemoveAllMonitors()
+{
+	// Snapshot the live indices under the lock, release, then remove one by one (RemoveMonitor
+	// re-locks internally and departs outside the lock).
+	std::vector<UINT> indices;
+	{
+		std::lock_guard<std::mutex> lock(m_MonitorsMutex);
+		indices.reserve(m_Monitors.size());
+		for (const auto& kv : m_Monitors) {
+			indices.push_back(kv.first);
+		}
+	}
+	if (!indices.empty()) {
+		stringstream ss;
+		ss << "Removing all " << indices.size() << " live monitor(s).";
+		vddlog("i", ss.str().c_str());
+	}
+	for (UINT idx : indices) {
+		RemoveMonitor(idx);
+	}
+}
+
+int IndirectDeviceContext::LowestFreeIndex()
+{
+	std::lock_guard<std::mutex> lock(m_MonitorsMutex);
+	for (UINT i = 0; i < MAX_MONITORS; i++) {
+		if (m_Monitors.find(i) == m_Monitors.end()) {
+			return static_cast<int>(i);
+		}
+	}
+	return -1;
+}
+
+size_t IndirectDeviceContext::LiveMonitorCount()
+{
+	std::lock_guard<std::mutex> lock(m_MonitorsMutex);
+	return m_Monitors.size();
 }
 
 void IndirectDeviceContext::AssignSwapChain(IDDCX_MONITOR Monitor, IDDCX_SWAPCHAIN SwapChain, LUID RenderAdapter, HANDLE NewFrameEvent)
@@ -4310,6 +4669,8 @@ NTSTATUS VirtualDisplayDriverEvtIddCxMonitorSetDefaultHdrMetadata(
 
 	// Priority 1: Use EDID-derived metadata if available
 	if (edidIntegrationEnabled && autoConfigureFromEdid) {
+		// Guard the store: RemoveMonitor may erase this monitor's entry concurrently.
+		std::lock_guard<std::mutex> hdrLock(g_HdrMetadataStoreMutex);
 		// First check for monitor-specific metadata
 		auto storeIt = g_HdrMetadataStore.find(MonitorObject);
 		if (storeIt != g_HdrMetadataStore.end() && storeIt->second.isValid) {
@@ -4359,7 +4720,10 @@ NTSTATUS VirtualDisplayDriverEvtIddCxMonitorSetDefaultHdrMetadata(
 	vddlog("i", logStream.str().c_str());
 
 	// Store the metadata for this monitor
-	g_HdrMetadataStore[MonitorObject] = metadata;
+	{
+		std::lock_guard<std::mutex> hdrLock(g_HdrMetadataStoreMutex);
+		g_HdrMetadataStore[MonitorObject] = metadata;
+	}
 
 	// Convert our metadata to the IddCx expected format
 	// Note: The actual HDR metadata structure would depend on the IddCx version
@@ -4562,6 +4926,8 @@ NTSTATUS VirtualDisplayDriverEvtIddCxMonitorSetGammaRamp(
 
 	// Priority 1: Use EDID-derived gamma settings if available
 	if (edidIntegrationEnabled && autoConfigureFromEdid) {
+		// Guard the store: RemoveMonitor may erase this monitor's entry concurrently.
+		std::lock_guard<std::mutex> gammaLock(g_GammaRampStoreMutex);
 		// First check for monitor-specific gamma ramp
 		auto storeIt = g_GammaRampStore.find(MonitorObject);
 		if (storeIt != g_GammaRampStore.end() && storeIt->second.isValid) {
@@ -4614,7 +4980,10 @@ NTSTATUS VirtualDisplayDriverEvtIddCxMonitorSetGammaRamp(
 		vddlog("i", logStream.str().c_str());
 
 		// Store the matrix for this monitor
-		g_GammaRampStore[MonitorObject] = gammaRamp;
+		{
+			std::lock_guard<std::mutex> gammaLock(g_GammaRampStoreMutex);
+			g_GammaRampStore[MonitorObject] = gammaRamp;
+		}
 
 		// In a full implementation, you would apply the matrix to the rendering pipeline here
 		// The exact API calls would depend on IddCx version and hardware capabilities
@@ -4643,7 +5012,10 @@ NTSTATUS VirtualDisplayDriverEvtIddCxMonitorSetGammaRamp(
 	}
 
 	// Store the final gamma ramp for this monitor
-	g_GammaRampStore[MonitorObject] = gammaRamp;
+	{
+		std::lock_guard<std::mutex> gammaLock(g_GammaRampStoreMutex);
+		g_GammaRampStore[MonitorObject] = gammaRamp;
+	}
 
 	logStream.str("");
 	logStream << "Gamma ramp configuration completed for monitor " << MonitorObject;

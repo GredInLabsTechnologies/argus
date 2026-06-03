@@ -21,6 +21,13 @@
 
 #include "Trace.h"
 
+// Maximum number of virtual monitors the adapter advertises (AdapterCaps.MaxMonitorsSupported).
+// Decoupled from the configured display count so the adapter can idle at 0 monitors and have ONE
+// monitor added/removed per connector index at runtime without an adapter reload.
+#ifndef MAX_MONITORS
+#define MAX_MONITORS 10
+#endif
+
 // Utility function declarations
 std::vector<std::string> split(std::string& input, char delimiter);
 std::string WStringToString(const std::wstring& wstr);
@@ -113,7 +120,26 @@ namespace Microsoft
             void InitAdapter();
             void FinishInit();
 
+            // Legacy entry point: create a monitor at a fixed connector index. Now a thin shim
+            // that routes to AddMonitor so the index map stays authoritative.
             void CreateMonitor(unsigned int index);
+
+            // ===== On-demand (spacedesk-style) monitor management =====
+            // AddMonitor: plug ONE monitor at the given connector index at runtime via
+            //   IddCxMonitorCreate + IddCxMonitorArrival. Stores the handle in m_Monitors[index]
+            //   under m_MonitorsMutex. Rejects if the index is already live or >= MAX_MONITORS.
+            // Returns true on success.
+            bool AddMonitor(UINT index);
+            // RemoveMonitor: unplug ONE monitor by index via IddCxMonitorDeparture, then erase
+            //   from m_Monitors, g_HdrMetadataStore and g_GammaRampStore. Returns true if removed.
+            bool RemoveMonitor(UINT index);
+            // RemoveAllMonitors: watchdog self-heal path; departs every live monitor.
+            void RemoveAllMonitors();
+            // LowestFreeIndex: lowest connector index in [0, MAX_MONITORS) not currently live,
+            //   or -1 if all slots are taken. Reuses freed indices.
+            int LowestFreeIndex();
+            // LiveMonitorCount: number of currently live monitors (locks m_MonitorsMutex).
+            size_t LiveMonitorCount();
 
             void AssignSwapChain(IDDCX_MONITOR Monitor, IDDCX_SWAPCHAIN SwapChain, LUID RenderAdapter, HANDLE NewFrameEvent);
             void UnassignSwapChain(IDDCX_MONITOR Monitor);
@@ -122,8 +148,14 @@ namespace Microsoft
 
             WDFDEVICE m_WdfDevice;
             IDDCX_ADAPTER m_Adapter;
-            IDDCX_MONITOR m_Monitor;
-            IDDCX_MONITOR m_Monitor2;
+
+            // Live monitors keyed by connector index. Replaces the old fixed m_Monitor / m_Monitor2.
+            // GUARDED BY m_MonitorsMutex. This mutex MUST remain separate from
+            // m_ProcessingThreadsMutex: IddCxMonitorDeparture may synchronously call
+            // UnassignSwapChain (which takes m_ProcessingThreadsMutex), so departure must NEVER
+            // be invoked while either lock is held (see RemoveMonitor for the lock-then-unlock dance).
+            std::map<UINT, IDDCX_MONITOR> m_Monitors;
+            std::mutex m_MonitorsMutex;
 
             std::map<IDDCX_MONITOR, std::unique_ptr<SwapChainProcessor>> m_ProcessingThreads;
             std::mutex m_ProcessingThreadsMutex;
@@ -133,6 +165,11 @@ namespace Microsoft
             static std::vector<BYTE> s_KnownMonitorEdid;
 
         private:
+            // Builds + creates + reports-arrival for one monitor at the given connector index.
+            // Returns the new IDDCX_MONITOR handle (or nullptr). Holds NO locks; the caller
+            // (AddMonitor) owns m_Monitors bookkeeping. Never call with m_MonitorsMutex held.
+            IDDCX_MONITOR CreateMonitorObject(UINT index);
+
             static std::map<LUID, std::shared_ptr<Direct3DDevice>, LuidComparator> s_DeviceCache;
             static std::mutex s_DeviceCacheMutex;
             static std::shared_ptr<Direct3DDevice> GetOrCreateDevice(LUID RenderAdapter);
