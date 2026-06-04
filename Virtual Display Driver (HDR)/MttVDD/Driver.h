@@ -74,12 +74,29 @@ namespace Microsoft
 
         /// <summary>
         /// Manages a thread that consumes buffers from an indirect display swap-chain object.
+        ///
+        /// ROUND-2 FIX (Issue 3 — Fix-5 timeout UAF): the worker thread dereferences `this`
+        /// (m_Device, m_hSwapChain, and calls WdfObjectDelete on the swap-chain) after RunCore()
+        /// returns. The old destructor bounded its join to 5s and, on WAIT_TIMEOUT, returned and
+        /// let the object be freed while the worker could still touch it → use-after-free + a
+        /// possible double swap-chain delete. The object is now owned by std::shared_ptr (stored
+        /// in m_ProcessingThreads); RunThread() holds its OWN shared_ptr copy for the whole worker
+        /// lifetime, so the object can NEVER be freed while the worker can still touch it. The
+        /// last reference to drop runs the destructor — which may therefore be the worker thread
+        /// itself; the destructor detects that and skips the self-join (a thread can't join
+        /// itself). Construct via std::make_shared<SwapChainProcessor>(...) then call Start().
         /// </summary>
-        class SwapChainProcessor
+        class SwapChainProcessor : public std::enable_shared_from_this<SwapChainProcessor>
         {
         public:
             SwapChainProcessor(IDDCX_SWAPCHAIN hSwapChain, std::shared_ptr<Direct3DDevice> Device, HANDLE NewFrameEvent);
             ~SwapChainProcessor();
+
+            // Starts the worker thread. MUST be called exactly once, right after the object is
+            // owned by a std::shared_ptr (it hands the worker a shared_ptr lifetime hold via
+            // shared_from_this()). Not in the constructor, because shared_from_this() is only
+            // valid once a shared_ptr owns the object.
+            void Start();
 
         private:
             static DWORD CALLBACK RunThread(LPVOID Argument);
@@ -93,6 +110,10 @@ namespace Microsoft
             HANDLE m_hAvailableBufferEvent;
             Microsoft::WRL::Wrappers::Thread m_hThread;
             Microsoft::WRL::Wrappers::Event m_hTerminateEvent;
+            // Worker OS thread id, captured when the thread starts. Used by ~SwapChainProcessor to
+            // detect "am I being destroyed ON the worker thread?" (the timed-out-teardown case,
+            // where the worker holds the last shared_ptr) and skip the self-join.
+            DWORD m_ThreadId = 0;
         };
 
         /// <summary>
@@ -149,6 +170,14 @@ namespace Microsoft
             WDFDEVICE m_WdfDevice;
             IDDCX_ADAPTER m_Adapter;
 
+            // The IddCx adapter must be created EXACTLY ONCE per device lifetime. EvtDeviceD0Entry
+            // fires on every D0 transition (initial start AND every sleep/hibernate wake), but
+            // IddCxAdapterInitAsync may be called only once — calling it again on wake would create
+            // a SECOND adapter, overwrite m_Adapter, and orphan every monitor bound to the original
+            // adapter. This flag guards the one-time init; subsequent D0 entries skip it (IddCx
+            // re-establishes swapchains itself per its D0 semantics).
+            bool m_AdapterInitialized = false;
+
             // Live monitors keyed by connector index. Replaces the old fixed m_Monitor / m_Monitor2.
             // GUARDED BY m_MonitorsMutex. This mutex MUST remain separate from
             // m_ProcessingThreadsMutex: IddCxMonitorDeparture may synchronously call
@@ -157,7 +186,10 @@ namespace Microsoft
             std::map<UINT, IDDCX_MONITOR> m_Monitors;
             std::mutex m_MonitorsMutex;
 
-            std::map<IDDCX_MONITOR, std::unique_ptr<SwapChainProcessor>> m_ProcessingThreads;
+            // ROUND-2 FIX (Issue 3): shared_ptr (was unique_ptr) so the worker thread can hold its
+            // own lifetime hold on the processor (see SwapChainProcessor). Dropping the map's
+            // reference during teardown does NOT free the object while the worker is still running.
+            std::map<IDDCX_MONITOR, std::shared_ptr<SwapChainProcessor>> m_ProcessingThreads;
             std::mutex m_ProcessingThreadsMutex;
 
         public:

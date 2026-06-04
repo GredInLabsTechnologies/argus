@@ -46,7 +46,16 @@ Environment:
 
 
 
-#define PIPE_NAME L"\\\\.\\pipe\\MTTVirtualDisplayPipe"
+// Control pipe name. AGNOSTIC: the driver knows nothing about any specific consumer; any
+// process with the right ACL (SYSTEM + Administrators) can drive it. Renamed from the old
+// product-coupled "MTTVirtualDisplayPipe" to the neutral "ArgusDisplay" (the Rust consumer
+// uses the same name). NOTE: this is the control-plane pipe name only; the INF hardware IDs
+// and device class are intentionally NOT renamed here (that is a coordinated, separately-signed
+// change — see TODO below).
+// TODO(inf): rename the INF hardware IDs / device class to the neutral identity in a coordinated,
+// re-signed driver-package update. Do NOT change them piecemeal here — it would break the
+// existing signed package's PnP match.
+#define PIPE_NAME L"\\\\.\\pipe\\ArgusDisplay"
 
 #pragma comment(lib, "xmllite.lib")
 #pragma comment(lib, "shlwapi.lib")
@@ -55,6 +64,14 @@ HANDLE hPipeThread = NULL;
 bool g_Running = true;
 mutex g_Mutex;
 HANDLE g_pipeHandle = INVALID_HANDLE_VALUE;
+// g_pipeHandle is the per-client reply channel set by the pipe thread, but vddlog() forwards log
+// lines to it AND is called from the watchdog/log threads — so the handle is read on those threads
+// while the pipe thread writes/closes/resets it (close+reset at end of HandleClient). That is a
+// data race / use-after-close. Guard EVERY g_pipeHandle access (write in SendToPipe, the read in
+// vddlog's forward check, and the set/reset in HandleClient) with this dedicated mutex. Keep this
+// lock LEAF-LEVEL: never call back into vddlog()/SendToPipe() (or anything that might) while it is
+// held, or the same thread would re-enter and deadlock.
+std::mutex g_pipeHandleMutex;
 
 // ============================================================================
 // On-demand monitor management (spacedesk-style: idle at 0, add/remove ONE by index)
@@ -69,15 +86,31 @@ namespace Microsoft { namespace IndirectDisp { class IndirectDeviceContext; } }
 Microsoft::IndirectDisp::IndirectDeviceContext* g_DeviceContext = nullptr;
 std::mutex g_DeviceContextMutex;
 
-// Watchdog (parsec-vdd / SudoVDA self-healing). If the broker stops PINGing for
-// g_WatchdogTimeoutSeconds, every live monitor is auto-removed so a crashed broker can't
-// leave orphan displays attached. Set g_WatchdogTimeoutSeconds to 0 to disable.
+// Watchdog (parsec-vdd / SudoVDA self-healing). If a consumer that has opted into the watchdog
+// stops PINGing for g_WatchdogTimeoutSeconds, every live monitor is auto-removed so a crashed
+// consumer can't leave orphan displays attached. Set g_WatchdogTimeoutSeconds to 0 to disable.
 // Runtime variable (not constexpr) so the disable check is a real branch (avoids C4127 under /WX)
 // and so a future registry/config knob can adjust it without a rebuild.
+//
+// OPT-IN (standalone-safe / AGNOSTIC): the watchdog is DISARMED until the FIRST PING is received.
+// A standalone install (e.g. monitors pre-connected at boot via numVirtualDisplays) with NO
+// consumer PINGing must keep its monitors forever — that's normal driver behavior. Only a consumer
+// that actively PINGs opts into the self-heal. Therefore arming happens ONLY on PING (g_WatchdogArmed),
+// never from boot or from ADD/REMOVE; ADD/REMOVE/SETDISPLAYCOUNT merely reset the countdown IF
+// already armed. While disarmed the thread idles and never removes monitors.
 int               g_WatchdogTimeoutSeconds = 3;
-std::atomic<int>  g_WatchdogCountdown{ 0 };   // seconds remaining before "bark"; reset on every PING/command
+std::atomic<int>  g_WatchdogCountdown{ 0 };   // seconds remaining before "bark"; reset on every PING/command (only meaningful once armed)
+std::atomic<bool> g_WatchdogArmed{ false };   // false until the first PING; while false the watchdog NEVER barks
 std::atomic<bool> g_WatchdogRunning{ false };
 HANDLE            g_WatchdogThread = NULL;
+// ROUND-2 FIX (Issue 1): the bare g_WatchdogThread HANDLE was written by StartWatchdog and
+// read/closed/cleared by StopWatchdog with no synchronization. StartWatchdog (InitAdapter) and
+// StopWatchdog (~IndirectDeviceContext) can run on different threads during a device
+// teardown+recreate, so a store-vs-close race could leak or double-close the handle. This small
+// LEAF-LEVEL mutex serializes every access to the g_WatchdogThread HANDLE. It is NEVER acquired
+// while holding g_DeviceContextMutex / m_MonitorsMutex / m_ProcessingThreadsMutex (and the
+// watchdog body never touches it), so it cannot participate in any lock-order cycle.
+std::mutex        g_WatchdogThreadMutex;
 
 using namespace std;
 using namespace Microsoft::IndirectDisp;
@@ -160,6 +193,23 @@ IDDCX_BITS_PER_COMPONENT SDRCOLOUR = IDDCX_BITS_PER_COMPONENT_8;
 IDDCX_BITS_PER_COMPONENT HDRCOLOUR = IDDCX_BITS_PER_COMPONENT_10;
 
 wstring ColourFormat = L"RGB";
+
+// ROUND-2 FIX (Issue 2 — Fix-3 data race): the SDR10/HDRPLUS pipe handlers WRITE the scalars
+// SDRCOLOUR/HDRCOLOUR, maincalc() REASSIGNS the vector s_KnownMonitorEdid, and the description
+// callbacks CLEAR+REFILL the vector s_KnownMonitorModes2 (RebuildKnownMonitorModesCache). All of
+// these are concurrently READ by IddCx callback threads (CreateTargetMode2,
+// ParseMonitorDescription/2, CreateMonitorObject) with no synchronization → torn scalar reads and
+// container UB (indexing a vector while another thread reassigns/clears it). g_SettingsMutex
+// serializes these. Discipline:
+//   * WRITE-lock in the SDR10/HDRPLUS handlers (scalars), around maincalc()'s s_KnownMonitorEdid
+//     reassignment, and around the s_KnownMonitorModes2 rebuild + the indexing that consumes it.
+//   * READ-lock at the top of each callback that reads them: snapshot scalars to locals; for the
+//     vectors, hold the lock across the rebuild+index (the callbacks both rebuild then index, so a
+//     single held region covers both safely).
+// NOTE: ColourFormat is written ONLY at DriverEntry (load time, before any monitor/callback exists),
+// so it is NOT raced and is intentionally read without this lock. NOTE: never hold g_SettingsMutex
+// across an IddCx call that can re-enter the driver — snapshot under the lock, release, then call.
+std::mutex g_SettingsMutex;
 
 // === EDID INTEGRATION SETTINGS ===
 bool edidIntegrationEnabled = false;
@@ -1505,6 +1555,10 @@ void float_to_vsync(float refresh_rate, int& num, int& den) {
 }
 
 void  SendToPipe(const std::string& logMessage) {
+	// Hold g_pipeHandleMutex across the handle test AND the WriteFile so the pipe thread can't
+	// close+reset g_pipeHandle between the check and the write (which would be a write to a closed
+	// handle). This is the leaf lock — do NOT call vddlog()/SendToPipe() recursively under it.
+	std::lock_guard<std::mutex> lk(g_pipeHandleMutex);
 	if (g_pipeHandle != INVALID_HANDLE_VALUE) {
 		DWORD bytesWritten;
 		DWORD logMessageSize = static_cast<DWORD>(logMessage.size());
@@ -1577,7 +1631,10 @@ void vddlog(const char* type, const char* message) {
 
 		fclose(logFile);
 
-		if (sendLogsThroughPipe && g_pipeHandle != INVALID_HANDLE_VALUE) {
+		// Forward the log line to whatever client is currently connected. Do NOT read g_pipeHandle
+		// here (this runs on the watchdog/log threads, racing the pipe thread's close+reset);
+		// SendToPipe re-checks the handle atomically under g_pipeHandleMutex.
+		if (sendLogsThroughPipe) {
 			string logMessage = ss.str() + " [" + logType + "] " + message + "\n";
 			SendToPipe(logMessage);
 		}
@@ -2089,28 +2146,77 @@ static Microsoft::IndirectDisp::IndirectDeviceContext* GetDeviceContext() {
 	return g_DeviceContext;
 }
 
-// Reset the watchdog countdown (broker is alive). Called on every inbound command.
+// Reset the watchdog countdown IF it is already armed. Called on every inbound command (ADD,
+// REMOVE, SETDISPLAYCOUNT, PING). This does NOT arm the watchdog — a consumer must opt in by
+// PINGing at least once (see WatchdogArm). Resetting a disarmed watchdog is a no-op so a non-
+// PINGing consumer never accidentally activates the self-heal.
 static void WatchdogKick() {
-	if (g_WatchdogTimeoutSeconds > 0) {
+	if (g_WatchdogTimeoutSeconds > 0 && g_WatchdogArmed.load(std::memory_order_relaxed)) {
 		g_WatchdogCountdown.store(g_WatchdogTimeoutSeconds, std::memory_order_relaxed);
 	}
 }
 
-// Watchdog body: once per second decrement the countdown; on reaching 0 (broker went silent)
-// remove every live monitor so a crashed/disconnected broker can't leave orphan displays.
-// Mirrors parsec-vdd / SudoVDA self-healing.
+// Arm (opt in to) the watchdog and reset its countdown. Called ONLY when a PING is received: the
+// first PING flips the driver from "persist monitors unconditionally" (standalone behavior) to
+// "self-heal if the PINGing consumer goes silent". Never called from boot or from ADD.
+static void WatchdogArm() {
+	if (g_WatchdogTimeoutSeconds > 0) {
+		bool wasArmed = g_WatchdogArmed.exchange(true, std::memory_order_relaxed);
+		g_WatchdogCountdown.store(g_WatchdogTimeoutSeconds, std::memory_order_relaxed);
+		if (!wasArmed) {
+			vddlog("i", "Watchdog armed by first PING; self-heal now active for this consumer.");
+		}
+	}
+}
+
+// Watchdog body: once per second, ONLY while armed (a consumer has PINGed), decrement the
+// countdown; on reaching 0 (the PINGing consumer went silent) remove every live monitor so a
+// crashed/disconnected consumer can't leave orphan displays. While DISARMED the thread idles and
+// never removes monitors, so a standalone install with no pinger keeps its monitors forever.
+// Mirrors parsec-vdd / SudoVDA self-healing, made opt-in.
+//
+// ROUND-2 FIX (Issue 1 — residual watchdog UAF): the previous design relied on
+// StopWatchdog() doing a BOUNDED WaitForSingleObject(..., 2000) inside ~IndirectDeviceContext.
+// That is NOT a lifetime guarantee: if this thread is mid-RemoveAllMonitors() and exceeds 2s,
+// the destructor's wait times out, ~IndirectDeviceContext deletes the context, and this thread
+// then dereferences freed memory (use-after-free). The new design makes delete and the
+// watchdog's use of the context MUTUALLY EXCLUSIVE via g_DeviceContextMutex:
+//   - here, we acquire g_DeviceContextMutex and HOLD it across the ENTIRE
+//     LiveMonitorCount() + RemoveAllMonitors() sequence, reading the pointer under the lock and
+//     using it ONLY while held;
+//   - ~IndirectDeviceContext sets g_DeviceContext = nullptr UNDER the same mutex as the FIRST
+//     thing it does.
+// So the watchdog either (a) runs this whole block BEFORE the destructor nulls the pointer —
+// in which case the context is still fully alive and the destructor will block on the mutex
+// until we finish — or (b) sees g_DeviceContext == nullptr and skips entirely. There is no
+// window where it touches a half-destroyed object, and no unbounded hang: the work here is the
+// same depart sequence the destructor would otherwise run.
+//
+// LOCK ORDER (must stay acyclic): g_DeviceContextMutex -> m_MonitorsMutex
+// -> (IddCxMonitorDeparture is called OUTSIDE m_MonitorsMutex by RemoveMonitor)
+// -> m_ProcessingThreadsMutex. Nothing acquires g_DeviceContextMutex while holding
+// m_MonitorsMutex or m_ProcessingThreadsMutex, so holding g_DeviceContextMutex across
+// RemoveAllMonitors() (which internally takes m_MonitorsMutex then, separately,
+// m_ProcessingThreadsMutex via the swap-chain teardown) cannot deadlock.
 static DWORD WINAPI WatchdogProc(LPVOID) {
 	while (g_WatchdogRunning.load(std::memory_order_relaxed)) {
 		Sleep(1000);
 		if (!g_WatchdogRunning.load(std::memory_order_relaxed)) break;
 		if (g_WatchdogTimeoutSeconds <= 0) continue;
 
+		// Disarmed: no consumer has opted in via PING. Persist monitors unconditionally.
+		if (!g_WatchdogArmed.load(std::memory_order_relaxed)) continue;
+
 		int c = g_WatchdogCountdown.load(std::memory_order_relaxed);
 		if (c <= 0) {
-			// Already barked (or never armed). Only bark again if monitors are live.
-			auto* ctx = GetDeviceContext();
+			// Armed and expired: the PINGing consumer went silent. Take g_DeviceContextMutex and
+			// HOLD it across the whole self-heal so the context cannot be deleted under us (see
+			// the lifetime-guarantee note above). Read the pointer under the lock; use it only
+			// while held; release before looping.
+			std::lock_guard<std::mutex> lk(g_DeviceContextMutex);
+			auto* ctx = g_DeviceContext;
 			if (ctx && ctx->LiveMonitorCount() > 0) {
-				vddlog("w", "Watchdog: no PING from broker; removing all monitors (self-heal).");
+				vddlog("w", "Watchdog: no PING from consumer; removing all monitors (self-heal).");
 				ctx->RemoveAllMonitors();
 			}
 			continue;
@@ -2126,37 +2232,67 @@ static void StartWatchdog() {
 		return;
 	}
 	if (g_WatchdogRunning.exchange(true)) return; // already running
-	g_WatchdogCountdown.store(g_WatchdogTimeoutSeconds, std::memory_order_relaxed);
-	g_WatchdogThread = CreateThread(NULL, 0, WatchdogProc, NULL, 0, NULL);
-	if (g_WatchdogThread == NULL) {
+	// Start DISARMED. Do NOT arm or preset the countdown at boot: with no PINGing consumer the
+	// watchdog must never bark (a standalone install keeps its monitors). The first PING arms it
+	// via WatchdogArm(). This is the opt-in fix for the boot-time orphan-removal race.
+	g_WatchdogArmed.store(false, std::memory_order_relaxed);
+	g_WatchdogCountdown.store(0, std::memory_order_relaxed);
+	// ROUND-2 FIX (Issue 1): guard the bare g_WatchdogThread HANDLE store under
+	// g_WatchdogThreadMutex so it can't race StopWatchdog's close+clear during a device
+	// teardown+recreate.
+	HANDLE created = CreateThread(NULL, 0, WatchdogProc, NULL, 0, NULL);
+	{
+		std::lock_guard<std::mutex> lk(g_WatchdogThreadMutex);
+		g_WatchdogThread = created;
+	}
+	if (created == NULL) {
 		g_WatchdogRunning.store(false);
 		vddlog("e", "Failed to start watchdog thread.");
 	} else {
-		vddlog("i", "Watchdog started.");
+		vddlog("i", "Watchdog thread started (disarmed; arms on first PING).");
 	}
 }
 
 static void StopWatchdog() {
 	if (!g_WatchdogRunning.exchange(false)) return;
-	if (g_WatchdogThread) {
-		WaitForSingleObject(g_WatchdogThread, 2000);
-		CloseHandle(g_WatchdogThread);
+	// ROUND-2 FIX (Issue 1): no longer the UAF backstop — correctness now comes from the
+	// watchdog holding g_DeviceContextMutex across its whole context use and the destructor
+	// nulling g_DeviceContext under that same mutex FIRST (see WatchdogProc / ~IndirectDeviceContext).
+	// This join is therefore purely a tidy thread-handle cleanup. We still keep the bounded wait so
+	// teardown can't hang, and we take the handle UNDER g_WatchdogThreadMutex (briefly) so the
+	// store-vs-close race with StartWatchdog is closed. The wait/close run OUTSIDE the lock to keep
+	// it leaf-level and so a concurrent StartWatchdog isn't blocked for the duration of the wait.
+	HANDLE toJoin = NULL;
+	{
+		std::lock_guard<std::mutex> lk(g_WatchdogThreadMutex);
+		toJoin = g_WatchdogThread;
 		g_WatchdogThread = NULL;
+	}
+	if (toJoin) {
+		WaitForSingleObject(toJoin, 2000);
+		CloseHandle(toJoin);
 	}
 	vddlog("i", "Watchdog stopped.");
 }
 
 // Legacy compatibility shim. The on-demand model never reloads the adapter; settings that used to
-// trigger a full reinit (HDR+/SDR10/EDID/GPU toggles) now just log. The adapter stays up and the
-// new EDID/caps take effect on the next AddMonitor. Kept as a no-op so the many existing call
-// sites still compile without sprinkling #ifdefs.
+// trigger a full reinit (HDR+/SDR10/EDID/GPU toggles) now update their in-memory globals directly
+// in the pipe handlers above. Because AddMonitor rebuilds the EDID (maincalc) and the per-monitor
+// description callbacks read the colour/format globals live, a setting change takes effect on every
+// monitor ADDED AFTER the change. Monitors that are already live keep their current description
+// until they are removed and re-added (depart+re-arrive). The adapter itself is created once per
+// device lifetime and is NOT recreated here. Kept as a no-op so the many existing call sites still
+// compile without sprinkling #ifdefs.
 void ReloadDriver(HANDLE /*hPipe*/) {
-	vddlog("i", "ReloadDriver is a no-op under the on-demand model; setting will apply on next AddMonitor.");
+	vddlog("i", "ReloadDriver is a no-op under the on-demand model; setting changes apply to monitors added after the change (existing monitors must be re-added to pick them up).");
 }
 
 
 void HandleClient(HANDLE hPipe) {
-	g_pipeHandle = hPipe;
+	{
+		std::lock_guard<std::mutex> lk(g_pipeHandleMutex);
+		g_pipeHandle = hPipe;
+	}
 	vddlog("p", "Client Handling Enabled");
 	wchar_t buffer[128];
 	DWORD bytesRead;
@@ -2204,12 +2340,25 @@ void HandleClient(HANDLE hPipe) {
 			wchar_t* param = buffer + 8;
 			if (wcsncmp(param, L"true", 4) == 0) {
 				UpdateXmlToggleSetting(true, L"HDRPlus");
-				vddlog("c", "HDR+ Enabled"); 
+				// Update the IN-MEMORY global (+ derived bit depth) so the next AddMonitor uses it.
+				HDRPlus = true;
+				// ROUND-2 FIX (Issue 2): HDRCOLOUR is read by IddCx callback threads (CreateTargetMode2,
+				// ParseMonitorDescription2). WRITE-lock the scalar store to avoid a torn read.
+				{
+					std::lock_guard<std::mutex> lk(g_SettingsMutex);
+					HDRCOLOUR = IDDCX_BITS_PER_COMPONENT_12;
+				}
+				vddlog("c", "HDR+ Enabled (applies to monitors added after this change)");
 				ReloadDriver(hPipe);
-			} 
+			}
 			else if (wcsncmp(param, L"false", 5) == 0) {
 				UpdateXmlToggleSetting(false, L"HDRPlus");
-				vddlog("c", "HDR+ Disabled");
+				HDRPlus = false;
+				{
+					std::lock_guard<std::mutex> lk(g_SettingsMutex);
+					HDRCOLOUR = IDDCX_BITS_PER_COMPONENT_10;
+				}
+				vddlog("c", "HDR+ Disabled (applies to monitors added after this change)");
 				ReloadDriver(hPipe);
 			}
 		}
@@ -2217,12 +2366,24 @@ void HandleClient(HANDLE hPipe) {
 			wchar_t* param = buffer + 6;
 			if (wcsncmp(param, L"true", 4) == 0) {
 				UpdateXmlToggleSetting(true, L"SDR10bit");
-				vddlog("c", "SDR 10 Bit Enabled");
+				SDR10 = true;
+				// ROUND-2 FIX (Issue 2): SDRCOLOUR is read by IddCx callback threads. WRITE-lock the
+				// scalar store to avoid a torn read.
+				{
+					std::lock_guard<std::mutex> lk(g_SettingsMutex);
+					SDRCOLOUR = IDDCX_BITS_PER_COMPONENT_10;
+				}
+				vddlog("c", "SDR 10 Bit Enabled (applies to monitors added after this change)");
 				ReloadDriver(hPipe);
 			}
 			else if (wcsncmp(param, L"false", 5) == 0) {
 				UpdateXmlToggleSetting(false, L"SDR10bit");
-				vddlog("c", "SDR 10 Bit Disabled");
+				SDR10 = false;
+				{
+					std::lock_guard<std::mutex> lk(g_SettingsMutex);
+					SDRCOLOUR = IDDCX_BITS_PER_COMPONENT_8;
+				}
+				vddlog("c", "SDR 10 Bit Disabled (applies to monitors added after this change)");
 				ReloadDriver(hPipe);
 			}
 		}
@@ -2230,12 +2391,14 @@ void HandleClient(HANDLE hPipe) {
 			wchar_t* param = buffer + 11;
 			if (wcsncmp(param, L"true", 4) == 0) {
 				UpdateXmlToggleSetting(true, L"CustomEdid");
-				vddlog("c", "Custom Edid Enabled");
+				customEdid = true;
+				vddlog("c", "Custom Edid Enabled (applies to monitors added after this change)");
 				ReloadDriver(hPipe);
 			}
 			else if (wcsncmp(param, L"false", 5) == 0) {
 				UpdateXmlToggleSetting(false, L"CustomEdid");
-				vddlog("c", "Custom Edid Disabled");
+				customEdid = false;
+				vddlog("c", "Custom Edid Disabled (applies to monitors added after this change)");
 				ReloadDriver(hPipe);
 			}
 		}
@@ -2243,12 +2406,14 @@ void HandleClient(HANDLE hPipe) {
 			wchar_t* param = buffer + 13;
 			if (wcsncmp(param, L"true", 4) == 0) {
 				UpdateXmlToggleSetting(true, L"PreventSpoof");
-				vddlog("c", "Prevent Spoof Enabled");
+				preventManufacturerSpoof = true;
+				vddlog("c", "Prevent Spoof Enabled (applies to monitors added after this change)");
 				ReloadDriver(hPipe);
 			}
 			else if (wcsncmp(param, L"false", 5) == 0) {
 				UpdateXmlToggleSetting(false, L"PreventSpoof");
-				vddlog("c", "Prevent Spoof Disabled");
+				preventManufacturerSpoof = false;
+				vddlog("c", "Prevent Spoof Disabled (applies to monitors added after this change)");
 				ReloadDriver(hPipe);
 			}
 		}
@@ -2256,12 +2421,14 @@ void HandleClient(HANDLE hPipe) {
 			wchar_t* param = buffer + 12;
 			if (wcsncmp(param, L"true", 4) == 0) {
 				UpdateXmlToggleSetting(true, L"EdidCeaOverride");
-				vddlog("c", "Cea override Enabled");
+				edidCeaOverride = true;
+				vddlog("c", "Cea override Enabled (applies to monitors added after this change)");
 				ReloadDriver(hPipe);
 			}
 			else if (wcsncmp(param, L"false", 5) == 0) {
 				UpdateXmlToggleSetting(false, L"EdidCeaOverride");
-				vddlog("c", "Cea override Disabled");
+				edidCeaOverride = false;
+				vddlog("c", "Cea override Disabled (applies to monitors added after this change)");
 				ReloadDriver(hPipe);
 			}
 		}
@@ -2269,11 +2436,13 @@ void HandleClient(HANDLE hPipe) {
 			wchar_t* param = buffer + 15;
 			if (wcsncmp(param, L"true", 4) == 0) {
 				UpdateXmlToggleSetting(true, L"HardwareCursor");
-				vddlog("c", "Hardware Cursor Enabled");
+				hardwareCursor = true;
+				vddlog("c", "Hardware Cursor Enabled (applies to monitors added after this change)");
 				ReloadDriver(hPipe);
 			}
 			else if (wcsncmp(param, L"false", 5) == 0) {
 				UpdateXmlToggleSetting(false, L"HardwareCursor");
+				hardwareCursor = false;
 				vddlog("c", "Hardware Cursor Disabled");
 				ReloadDriver(hPipe);
 			}
@@ -2307,72 +2476,88 @@ void HandleClient(HANDLE hPipe) {
 			WideCharToMultiByte(CP_UTF8, 0, gpuName.c_str(), static_cast<int>(gpuName.length()), &gpuNameNarrow[0], size_needed, nullptr, nullptr);
 
 			vddlog("c", ("Setting GPU to: " + gpuNameNarrow).c_str());
+			// Update the IN-MEMORY global so a future adapter (re)init picks the new render GPU.
+			// NOTE: the render adapter is bound when the IddCx adapter is created, which now happens
+			// exactly once per device lifetime; a live GPU switch requires an actual device restart
+			// (PnP disable/enable), not the no-op ReloadDriver.
+			gpuname = gpuName;
 			if (UpdateXmlGpuSetting(gpuName.c_str())) {
-				vddlog("c", "Gpu Changed, Restarting Driver");
+				vddlog("c", "GPU setting persisted (takes effect on the next device restart / adapter init).");
 			}
 			else {
-				vddlog("e", "Failed to update GPU setting in XML. Restarting anyway");
+				vddlog("e", "Failed to update GPU setting in XML (in-memory value updated for next adapter init).");
 			}
 			ReloadDriver(hPipe);
 		}
-		// ===== On-demand monitor control (CONTRACT — the Rust broker codes to this) =====
+		// ===== On-demand monitor control (CONTRACT — any pipe consumer codes to this) =====
 		// "ADD"            -> add ONE monitor at the lowest free connector index; the chosen
-		//                     index is written back to the pipe client as a UTF-16 integer string.
+		//                     index is written back to the pipe client as an ASCII integer string.
 		// "REMOVE <index>" -> remove the monitor at <index>.
 		// Both kick the watchdog. Must be checked BEFORE the legacy "SETDISPLAYCOUNT" handling.
 		else if (wcsncmp(buffer, L"ADD", 3) == 0 &&
 		         (buffer[3] == L'\0' || buffer[3] == L'\r' || buffer[3] == L'\n' || buffer[3] == L' ')) {
 			WatchdogKick();
-			auto* ctx = GetDeviceContext();
-			if (!ctx) {
-				vddlog("e", "ADD failed: device context not ready (adapter not initialized).");
-				SendToPipe("ERR");
-			}
-			else {
-				int idx = ctx->LowestFreeIndex();
-				if (idx < 0) {
-					vddlog("e", "ADD failed: no free connector index (MAX_MONITORS reached).");
-					SendToPipe("ERR");
-				}
-				else if (!ctx->AddMonitor(static_cast<UINT>(idx))) {
-					vddlog("e", "ADD failed: AddMonitor returned false.");
-					SendToPipe("ERR");
+			// RESIDUAL FIX (same UAF class as the watchdog): HOLD g_DeviceContextMutex across the
+			// ENTIRE context use. The destructor nulls g_DeviceContext under this mutex FIRST, so the
+			// pipe thread cannot deref a context being deleted. Lock order g_DeviceContextMutex ->
+			// m_MonitorsMutex (AddMonitor takes m_MonitorsMutex) stays acyclic. Reply is sent to the
+			// pipe AFTER releasing the lock (SendToPipe only takes leaf-level g_pipeHandleMutex).
+			std::string addReply;
+			{
+				std::lock_guard<std::mutex> ctxLk(g_DeviceContextMutex);
+				auto* ctx = g_DeviceContext;
+				if (!ctx) {
+					vddlog("e", "ADD failed: device context not ready (adapter not initialized).");
+					addReply = "ERR";
 				}
 				else {
-					// Write the chosen index back to the broker as an ASCII integer string
-					// (same channel/encoding as PONG/OK/ERR via SendToPipe, so the broker
-					// parses every on-demand reply uniformly as ASCII).
-					std::string reply = std::to_string(idx);
-					SendToPipe(reply);
-					vddlog("i", ("ADD -> index " + reply).c_str());
+					int idx = ctx->LowestFreeIndex();
+					if (idx < 0) {
+						vddlog("e", "ADD failed: no free connector index (MAX_MONITORS reached).");
+						addReply = "ERR";
+					}
+					else if (!ctx->AddMonitor(static_cast<UINT>(idx))) {
+						vddlog("e", "ADD failed: AddMonitor returned false.");
+						addReply = "ERR";
+					}
+					else {
+						// ASCII integer index back to the broker (uniform with PONG/OK/ERR).
+						addReply = std::to_string(idx);
+						vddlog("i", ("ADD -> index " + addReply).c_str());
+					}
 				}
 			}
+			SendToPipe(addReply);
 		}
 		else if (wcsncmp(buffer, L"REMOVE", 6) == 0) {
 			WatchdogKick();
 			int index = -1;
+			std::string remReply;
 			// Accept "REMOVE 3", "REMOVE  3", etc. swscanf_s tolerates leading spaces.
 			if (swscanf_s(buffer + 6, L"%d", &index) == 1 && index >= 0) {
-				auto* ctx = GetDeviceContext();
+				// Same lifetime guarantee as ADD: hold g_DeviceContextMutex across the deref.
+				std::lock_guard<std::mutex> ctxLk(g_DeviceContextMutex);
+				auto* ctx = g_DeviceContext;
 				if (!ctx) {
 					vddlog("e", "REMOVE failed: device context not ready.");
-					SendToPipe("ERR");
+					remReply = "ERR";
 				}
 				else if (ctx->RemoveMonitor(static_cast<UINT>(index))) {
 					std::wstring lg = L"REMOVE index " + std::to_wstring(index) + L" -> OK";
 					vddlog("i", WStringToString(lg).c_str());
-					SendToPipe("OK");
+					remReply = "OK";
 				}
 				else {
 					std::wstring lg = L"REMOVE index " + std::to_wstring(index) + L" -> not live";
 					vddlog("w", WStringToString(lg).c_str());
-					SendToPipe("ERR");
+					remReply = "ERR";
 				}
 			}
 			else {
 				vddlog("e", "REMOVE failed: missing/invalid index. Usage: REMOVE <index>");
-				SendToPipe("ERR");
+				remReply = "ERR";
 			}
+			SendToPipe(remReply);
 		}
 		// Legacy fixed-count command. Under the on-demand model this no longer reloads the
 		// adapter; it only persists the configured count (used as a preconnect hint at next
@@ -2409,8 +2594,10 @@ void HandleClient(HANDLE hPipe) {
 
 		}
 		else if (wcsncmp(buffer, L"PING", 4) == 0) {
-			// Watchdog keepalive: reset the countdown and reply PONG (CONTRACT).
-			WatchdogKick();
+			// Watchdog keepalive: the FIRST PING ARMS the watchdog (opt-in self-heal); every PING
+			// resets the countdown. Reply PONG (CONTRACT). A consumer that never PINGs never arms
+			// the watchdog, so its monitors persist unconditionally.
+			WatchdogArm();
 			SendToPipe("PONG");
 			vddlog("p", "Heartbeat Ping");
 		}
@@ -2424,9 +2611,15 @@ void HandleClient(HANDLE hPipe) {
 			vddlog("e", narrowString.c_str());
 		}
 	}
+	// Clear g_pipeHandle BEFORE closing the OS handle, under the lock, so no logging thread can
+	// WriteFile() to a handle that's about to be (or has just been) closed. Order matters: reset
+	// first (so SendToPipe sees INVALID and skips), THEN Disconnect/Close.
+	{
+		std::lock_guard<std::mutex> lk(g_pipeHandleMutex);
+		g_pipeHandle = INVALID_HANDLE_VALUE; // stop all threads from using this client reply channel
+	}
 	DisconnectNamedPipe(hPipe);
 	CloseHandle(hPipe);
-	g_pipeHandle = INVALID_HANDLE_VALUE; // This value determines whether or not all data gets sent back through the pipe or just the handling pipe data
 }
 
 
@@ -3130,7 +3323,11 @@ NTSTATUS VirtualDisplayDriverDeviceD0Entry(WDFDEVICE Device, WDF_POWER_DEVICE_ST
 		<< "\n  Previous State: " << PreviousState;
 	vddlog("d", logStream.str().c_str());
 
-	// This function is called by WDF to start the device in the fully-on power state.
+	// This function is called by WDF to start the device in the fully-on power state. It fires on
+	// the initial start AND on every wake from a low-power state. InitAdapter() is therefore
+	// idempotent: it creates the IddCx adapter only on the first call (guarded by
+	// m_AdapterInitialized) and is a no-op for the adapter on subsequent D0 entries, so a
+	// sleep/wake cycle does NOT spawn a second adapter or orphan existing monitors.
 
 	/*
 	auto* pContext = WdfObjectGet_IndirectDeviceContextWrapper(Device);
@@ -3279,17 +3476,37 @@ SwapChainProcessor::SwapChainProcessor(IDDCX_SWAPCHAIN hSwapChain, shared_ptr<Di
 		vddlog("d", logStream.str().c_str());
 	}
 
-	// Immediately create and run the swap-chain processing thread, passing 'this' as the thread parameter
-	m_hThread.Attach(CreateThread(nullptr, 0, RunThread, this, 0, nullptr));
-	if (!m_hThread.Get())
+	// ROUND-2 FIX (Issue 3): the worker thread is NOT started here anymore. It is started by
+	// Start() (called right after a std::shared_ptr owns this object) so the worker can take a
+	// shared_ptr lifetime hold via shared_from_this(), which is only valid once a shared_ptr owns
+	// the object. See SwapChainProcessor::Start / RunThread.
+}
+
+// ROUND-2 FIX (Issue 3): start the worker and hand it a shared_ptr lifetime hold. The worker's
+// hold guarantees the object outlives the worker even if the teardown path drops the map's
+// reference first (and even if the destructor's join times out). The heap shared_ptr is owned by
+// the worker and released in RunThread when the worker returns.
+void SwapChainProcessor::Start()
+{
+	stringstream logStream;
+
+	// Heap-allocate a shared_ptr copy that the new thread owns for its entire lifetime. This is the
+	// lifetime hold: as long as the worker runs, the refcount is >= 1, so the object cannot be freed.
+	auto* threadHold = new std::shared_ptr<SwapChainProcessor>(shared_from_this());
+
+	DWORD threadId = 0;
+	HANDLE h = CreateThread(nullptr, 0, RunThread, threadHold, 0, &threadId);
+	if (!h)
 	{
-		logStream.str("");
+		// Failed to start: reclaim the hold we allocated for the (never-created) thread.
+		delete threadHold;
 		logStream << "Failed to create swap-chain processing thread. GetLastError: " << GetLastError();
 		vddlog("e", logStream.str().c_str());
 	}
 	else
 	{
-		logStream.str("");
+		m_ThreadId = threadId;
+		m_hThread.Attach(h);
 		logStream << "Swap-chain processing thread created and started successfully.";
 		vddlog("d", logStream.str().c_str());
 	}
@@ -3318,32 +3535,61 @@ SwapChainProcessor::~SwapChainProcessor()
 		vddlog("e", logStream.str().c_str());
 	}
 
+	// ROUND-2 FIX (Issue 3 — Fix-5 timeout UAF): this object is owned by a std::shared_ptr and the
+	// worker holds its OWN shared_ptr copy for its whole lifetime, so the destructor runs only when
+	// the LAST reference drops. Two cases:
+	//
+	//   (a) The worker already finished and released its hold; the teardown path then dropped the
+	//       map's reference, so the destructor runs on the TEARDOWN thread. m_hThread has already
+	//       signaled exit, so the join below returns immediately.
+	//
+	//   (b) Teardown dropped the map's reference WHILE the worker was still running. The object
+	//       stayed alive (worker's hold). When the worker returns, RunThread releases the last
+	//       reference and the destructor runs ON THE WORKER THREAD. A thread can't join itself, so
+	//       we MUST skip the wait in this case (m_ThreadId == GetCurrentThreadId()); the worker is
+	//       already unwinding, so there's nothing to wait for.
+	//
+	// Either way the object is NEVER freed while the worker can still touch it — no UAF, and no
+	// double WdfObjectDelete of the swap-chain (the worker is the sole place that deletes it and it
+	// runs to completion before the object dies).
 	if (m_hThread.Get())
 	{
-		// Wait for the thread to terminate
-		DWORD waitResult = WaitForSingleObject(m_hThread.Get(), INFINITE);
-		switch (waitResult)
+		if (m_ThreadId != 0 && m_ThreadId == GetCurrentThreadId())
 		{
-		case WAIT_OBJECT_0:
-			logStream.str(""); 
-			logStream << "Thread terminated successfully.";
+			// Case (b): destructor is running on the worker thread itself (it held the last
+			// reference). Do NOT join — that would be a self-join (deadlock). The worker is
+			// already past RunCore() and exiting.
+			logStream.str("");
+			logStream << "Destructor running on the worker thread (worker held the last reference); skipping self-join.";
 			vddlog("d", logStream.str().c_str());
-			break;
-		case WAIT_ABANDONED:
-			logStream.str(""); 
-			logStream << "Thread wait was abandoned. GetLastError: " << GetLastError();
-			vddlog("e", logStream.str().c_str());
-			break;
-		case WAIT_TIMEOUT:
-			logStream.str(""); 
-			logStream << "Thread wait timed out. This should not happen. GetLastError: " << GetLastError();
-			vddlog("e", logStream.str().c_str());
-			break;
-		default:
-			logStream.str(""); 
-			logStream << "Unexpected result from WaitForSingleObject. GetLastError: " << GetLastError();
-			vddlog("e", logStream.str().c_str());
-			break;
+		}
+		else
+		{
+			// Case (a): some other thread is destroying us; the worker has already released its
+			// hold, so it has finished (or is finishing). An UNBOUNDED join is safe here precisely
+			// because the worker's lifetime hold guarantees it cannot be stuck touching a freed
+			// object — and we are NOT on the worker thread, so we cannot self-deadlock. (Previously
+			// this was a bounded 5s wait that, on timeout, freed the object out from under a live
+			// worker — the UAF this fix removes.)
+			DWORD waitResult = WaitForSingleObject(m_hThread.Get(), INFINITE);
+			switch (waitResult)
+			{
+			case WAIT_OBJECT_0:
+				logStream.str("");
+				logStream << "Thread terminated successfully.";
+				vddlog("d", logStream.str().c_str());
+				break;
+			case WAIT_ABANDONED:
+				logStream.str("");
+				logStream << "Thread wait was abandoned. GetLastError: " << GetLastError();
+				vddlog("e", logStream.str().c_str());
+				break;
+			default:
+				logStream.str("");
+				logStream << "Unexpected result from WaitForSingleObject. GetLastError: " << GetLastError();
+				vddlog("e", logStream.str().c_str());
+				break;
+			}
 		}
 	}
 	else
@@ -3358,10 +3604,19 @@ DWORD CALLBACK SwapChainProcessor::RunThread(LPVOID Argument)
 {
 	stringstream logStream;
 
-	logStream << "RunThread started. Argument: " << Argument;
+	// ROUND-2 FIX (Issue 3): the argument is a heap-allocated shared_ptr<SwapChainProcessor> that
+	// represents THIS worker's lifetime hold (created in Start()). Adopt it into a local so it is
+	// released exactly when the worker returns — keeping the object alive for the entire duration of
+	// Run()/RunCore() (which deref this, m_Device, m_hSwapChain and call WdfObjectDelete on the
+	// swap-chain). When this local goes out of scope the hold drops; if it was the last reference,
+	// ~SwapChainProcessor runs here on the worker thread and correctly skips the self-join.
+	std::shared_ptr<SwapChainProcessor> self(*reinterpret_cast<std::shared_ptr<SwapChainProcessor>*>(Argument));
+	delete reinterpret_cast<std::shared_ptr<SwapChainProcessor>*>(Argument);
+
+	logStream << "RunThread started for processor: " << static_cast<void*>(self.get());
 	vddlog("d", logStream.str().c_str());
 
-	reinterpret_cast<SwapChainProcessor*>(Argument)->Run();
+	self->Run();
 	return 0;
 }
 
@@ -3742,7 +3997,16 @@ int maincalc() {
 	BYTE checksum = calculateChecksum(edid);
 	edid[127] = checksum;
 	// Setting this variable is depricated, hardcoded edid is either returned or custom in loading edid function
-	IndirectDeviceContext::s_KnownMonitorEdid = edid;
+	// ROUND-2 FIX (Issue 2): the reassignment of the s_KnownMonitorEdid vector races
+	// CreateMonitorObject's read of s_KnownMonitorEdid.data()/.size() on a callback thread.
+	// WRITE-lock the reassignment. We do the (potentially slow) EDID computation ABOVE without the
+	// lock and only take it for the swap, so the critical section is minimal and never spans an
+	// IddCx call. CreateMonitorObject snapshots the EDID bytes under the same lock before passing
+	// the pointer to IddCxMonitorCreate.
+	{
+		std::lock_guard<std::mutex> lk(g_SettingsMutex);
+		IndirectDeviceContext::s_KnownMonitorEdid = edid;
+	}
 	return 0;
 }
 
@@ -3835,13 +4099,24 @@ IndirectDeviceContext::IndirectDeviceContext(_In_ WDFDEVICE WdfDevice) :
 IndirectDeviceContext::~IndirectDeviceContext()
 {
 	stringstream logStream;
-	std::map<IDDCX_MONITOR, std::unique_ptr<SwapChainProcessor>> processingThreads;
+	// ROUND-2 FIX (Issue 3): shared_ptr slots (matches m_ProcessingThreads). Any processors still
+	// present are signaled to terminate below before their references are dropped.
+	std::map<IDDCX_MONITOR, std::shared_ptr<SwapChainProcessor>> processingThreads;
 
 	logStream << "Destroying IndirectDeviceContext. Releasing per-monitor processing threads.";
 	vddlog("d", logStream.str().c_str());
 
-	// Drop the cached pointer first so the pipe/watchdog thread can no longer reach a
-	// context that is being torn down.
+	// ROUND-2 FIX (Issue 1 — residual watchdog UAF): the previous code relied on StopWatchdog()'s
+	// BOUNDED 2s join as the UAF backstop. That is NOT a lifetime guarantee — if the watchdog was
+	// mid-RemoveAllMonitors() and exceeded 2s, the join timed out and we deleted the context out
+	// from under it (UAF). Correctness now comes from MUTUAL EXCLUSION, not timing:
+	//
+	//   STEP 1 (FIRST thing, under g_DeviceContextMutex): drop the cached pointer. Acquiring the
+	//   mutex here BLOCKS until any watchdog iteration currently inside its self-heal block (which
+	//   holds the same mutex across LiveMonitorCount()+RemoveAllMonitors()) has fully finished —
+	//   and during that whole window THIS object is still alive (we haven't run any teardown yet).
+	//   Once we null g_DeviceContext and release the mutex, the watchdog's next iteration reads
+	//   nullptr and skips: it can never touch this object again.
 	{
 		std::lock_guard<std::mutex> lk(g_DeviceContextMutex);
 		if (g_DeviceContext == this) {
@@ -3849,14 +4124,34 @@ IndirectDeviceContext::~IndirectDeviceContext()
 		}
 	}
 
-	// Depart any monitors still attached so the OS doesn't keep orphan targets.
+	// STEP 2: now that the watchdog can no longer reach this context, stop+join its thread purely
+	// to clean up the handle (no longer a correctness barrier). StopWatchdog holds NO driver locks
+	// and the watchdog body never acquires g_WatchdogThreadMutex, so there is no stop-vs-watchdog
+	// deadlock.
+	StopWatchdog();
+
+	// STEP 3: depart any monitors still attached so the OS doesn't keep orphan targets.
 	// RemoveAllMonitors takes only m_MonitorsMutex internally and releases it before each
-	// IddCxMonitorDeparture, so it is safe to call here.
+	// IddCxMonitorDeparture, so it is safe to call here. (The watchdog can no longer also be in
+	// RemoveAllMonitors concurrently — it observed the nulled pointer in STEP 1.)
 	RemoveAllMonitors();
 
 	{
 		std::lock_guard<std::mutex> lock(m_ProcessingThreadsMutex);
 		processingThreads.swap(m_ProcessingThreads);
+	}
+
+	// ROUND-2 FIX (Issue 3): signal every remaining worker to terminate BEFORE the local map drops
+	// its references (done OUTSIDE m_ProcessingThreadsMutex). We must signal rather than rely on
+	// ~SwapChainProcessor, because under the shared_ptr model a worker may hold the last reference
+	// and the destructor would then run on the worker thread (which can't be what wakes it). After
+	// signaling, the local map clearing releases our references; any still-running worker stays
+	// alive via its own hold until it exits and tears itself down. (In practice STEP 3's
+	// RemoveAllMonitors already unassigned most/all via IddCxMonitorDeparture -> UnassignSwapChain.)
+	for (auto& kv : processingThreads) {
+		if (kv.second && kv.second->m_hTerminateEvent.Get()) {
+			SetEvent(kv.second->m_hTerminateEvent.Get());
+		}
 	}
 
 	logStream.str("");
@@ -3868,8 +4163,22 @@ IndirectDeviceContext::~IndirectDeviceContext()
 
 void IndirectDeviceContext::InitAdapter()
 {
-	maincalc();
 	stringstream logStream;
+
+	// FIX (re-init on every D0 transition): IddCxAdapterInitAsync must be called EXACTLY ONCE per
+	// device lifetime. EvtDeviceD0Entry calls InitAdapter() on every D0 entry — including every
+	// wake from sleep/hibernate. Without this guard a wake would create a SECOND IddCx adapter,
+	// overwrite m_Adapter, and orphan all monitors bound to the first adapter. On subsequent D0
+	// entries we do NOT re-init the adapter; IddCx re-establishes swapchains on its own per its D0
+	// power semantics. We still make sure the (process-global) watchdog thread is running, since it
+	// may have been stopped by a previous device-context teardown.
+	if (m_AdapterInitialized) {
+		vddlog("i", "InitAdapter: adapter already initialized for this device; skipping re-init on D0 entry (swapchains are re-established by IddCx).");
+		StartWatchdog(); // idempotent: returns early if already running
+		return;
+	}
+
+	maincalc();
 
 	// ==============================
 	// TODO: Update the below diagnostic information in accordance with the target hardware. The strings and version
@@ -3891,7 +4200,7 @@ void IndirectDeviceContext::InitAdapter()
 	}
 
 	// Tier-1: advertise that every target mode we report is monitor-compatible. This lets us
-	// hand Windows the EXACT tablet panel resolution (e.g. a non-standard 2K aspect) without it
+	// hand Windows the EXACT requested panel resolution (e.g. a non-standard 2K aspect) without it
 	// being filtered out as an "incompatible" target mode. Guarded by availability so older
 	// IddCx headers still compile.
 #ifdef IDDCX_ADAPTER_FLAGS_ALL_TARGET_MODES_MONITOR_COMPATIBLE
@@ -3952,6 +4261,10 @@ void IndirectDeviceContext::InitAdapter()
 
 	if (NT_SUCCESS(Status))
 	{
+		// Mark the adapter as initialized so future D0 entries skip IddCxAdapterInitAsync (see the
+		// guard at the top of this function). Set only on success so a failed init can be retried.
+		m_AdapterInitialized = true;
+
 		// Store a reference to the WDF adapter handle
 		m_Adapter = AdapterInitOut.AdapterObject;
 		logStream << "Adapter handle stored successfully.";
@@ -3968,6 +4281,10 @@ void IndirectDeviceContext::InitAdapter()
 			std::lock_guard<std::mutex> lk(g_DeviceContextMutex);
 			g_DeviceContext = this;
 		}
+
+		// (Re)start the process-global watchdog thread for this device. Idempotent: returns early
+		// if already running. Needed because a prior device-context teardown stops+joins it.
+		StartWatchdog();
 	}
 	else {
 		logStream << "Failed to initialize adapter. Status: " << Status;
@@ -4004,15 +4321,17 @@ void IndirectDeviceContext::FinishInit()
 // Build a STABLE per-connector container ID GUID. Windows uses the container ID to remember a
 // monitor's position/layout across plug cycles, so the same connector index must always map to
 // the same GUID (otherwise the OS treats every re-add as a brand-new display and forgets the
-// tablet's arrangement). We namespace the GUID with the adapter/host so it's stable but distinct.
-// TODO (Tier-1): derive this from a per-tablet stable identity (e.g. the device serial the broker
-// passes) once the ADD command carries one, so multiple tablets keep separate remembered layouts.
+// display's arrangement). We namespace the GUID with the adapter/host so it's stable but distinct.
+// TODO (Tier-1): derive this from a per-display stable identity (e.g. a device serial the consumer
+// passes) once the ADD command carries one, so multiple displays keep separate remembered layouts.
+// NOTE: the byte values below are part of the on-disk container ID — do NOT change them or every
+// already-arranged display would be treated as brand-new and lose its remembered layout.
 static GUID MakeStableContainerId(UINT index)
 {
 	GUID g = {};
-	// Fixed namespace base ("MTT virtual display"). Only Data1 varies by connector index, which
+	// Fixed namespace base. Only Data1 varies by connector index, which
 	// keeps each index's container ID stable across add/remove cycles within this host.
-	g.Data1 = 0x4d54'5644u ^ index;   // 'MTVD' xor index
+	g.Data1 = 0x4d54'5644u ^ index;   // base constant xor index
 	g.Data2 = 0x0001;
 	g.Data3 = 0x4000;                 // RFC4122 version-4 nibble for well-formedness
 	const BYTE base[8] = { 0x8a, 0x00, 0x53, 0x55, 0x44, 0x4f, 0x56, 0x44 }; // ...SUDOVD
@@ -4039,15 +4358,27 @@ IDDCX_MONITOR IndirectDeviceContext::CreateMonitorObject(UINT index)
 	MonitorInfo.ConnectorIndex = index;
 	MonitorInfo.MonitorDescription.Size = sizeof(MonitorInfo.MonitorDescription);
 	MonitorInfo.MonitorDescription.Type = IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
-	if (s_KnownMonitorEdid.size() > UINT_MAX)
+
+	// ROUND-2 FIX (Issue 2): maincalc() (called from AddMonitor right before this) can REASSIGN
+	// s_KnownMonitorEdid on another thread. Reading .size()/.data() here unsynchronized races that
+	// reassignment (container UB: the backing buffer can be freed mid-read). Snapshot the EDID bytes
+	// into a LOCAL under g_SettingsMutex, then release the lock BEFORE the IddCxMonitorCreate call
+	// (we must never hold this lock across an IddCx call that can re-enter the driver). The local
+	// 'edidSnapshot' stays in scope through IddCxMonitorCreate, so pData remains valid.
+	std::vector<BYTE> edidSnapshot;
+	{
+		std::lock_guard<std::mutex> lk(g_SettingsMutex);
+		edidSnapshot = IndirectDeviceContext::s_KnownMonitorEdid;
+	}
+	if (edidSnapshot.size() > UINT_MAX)
 	{
 		vddlog("e", "Edid size passes UINT_Max, escape to prevent loading borked display");
 		return nullptr;
 	}
-	MonitorInfo.MonitorDescription.DataSize = static_cast<UINT>(s_KnownMonitorEdid.size());
-	MonitorInfo.MonitorDescription.pData = IndirectDeviceContext::s_KnownMonitorEdid.data();
+	MonitorInfo.MonitorDescription.DataSize = static_cast<UINT>(edidSnapshot.size());
+	MonitorInfo.MonitorDescription.pData = edidSnapshot.data();
 
-	// Stable container ID per connector index so Windows remembers each tablet's layout
+	// Stable container ID per connector index so Windows remembers each display's layout
 	// (was CoCreateGuid -> random every plug, which lost the remembered arrangement).
 	MonitorInfo.MonitorContainerId = MakeStableContainerId(index);
 	vddlog("d", "Assigned stable container ID");
@@ -4121,6 +4452,15 @@ bool IndirectDeviceContext::AddMonitor(UINT index)
 			return false;
 		}
 	}
+
+	// FIX (settings stop applying at runtime): rebuild the EDID from the CURRENT settings globals
+	// before creating the monitor, so a monitor added AFTER a CUSTOMEDID/PREVENTSPOOF/SDR10/HDR+
+	// pipe command reflects that change. The adapter is now init-once, so maincalc() no longer runs
+	// per-D0; doing it here is what makes settings apply to newly-added monitors. The per-monitor
+	// HDRCOLOUR/SDRCOLOUR/ColourFormat globals are read live by the monitor description callbacks,
+	// so they also apply to monitors added after a change. (Existing monitors keep their original
+	// description until they are removed and re-added.)
+	maincalc();
 
 	IDDCX_MONITOR handle = CreateMonitorObject(index);
 	if (handle == nullptr) {
@@ -4249,18 +4589,30 @@ void IndirectDeviceContext::AssignSwapChain(IDDCX_MONITOR Monitor, IDDCX_SWAPCHA
 	}
 	else
 	{
-		std::unique_ptr<SwapChainProcessor> previousProcessor;
-		auto newProcessor = std::make_unique<SwapChainProcessor>(SwapChain, Device, NewFrameEvent);
+		// ROUND-2 FIX (Issue 3): create via make_shared and Start() the worker AFTER a shared_ptr
+		// owns it (so the worker can take a shared_from_this() lifetime hold). The slot is now a
+		// shared_ptr; a replaced processor is moved out and torn down OUTSIDE the lock.
+		std::shared_ptr<SwapChainProcessor> previousProcessor;
+		auto newProcessor = std::make_shared<SwapChainProcessor>(SwapChain, Device, NewFrameEvent);
+		newProcessor->Start();
 
 		{
 			std::lock_guard<std::mutex> lock(m_ProcessingThreadsMutex);
 			auto& processorSlot = m_ProcessingThreads[Monitor];
 			previousProcessor = std::move(processorSlot);
-			processorSlot = std::move(newProcessor);
+			processorSlot = newProcessor;
 		}
 
+		// If we replaced an existing processor, signal its worker to terminate BEFORE we drop our
+		// reference. Under the shared_ptr model the destructor is NOT guaranteed to run on this
+		// thread (the worker may hold the last reference), so we cannot rely on ~SwapChainProcessor
+		// to signal termination — we must do it here so the old worker actually wakes and exits.
+		// This is done OUTSIDE m_ProcessingThreadsMutex (the lock-discipline rule for teardown).
 		if (previousProcessor) {
 			vddlog("d", "Replaced existing processing thread for this monitor only.");
+			if (previousProcessor->m_hTerminateEvent.Get()) {
+				SetEvent(previousProcessor->m_hTerminateEvent.Get());
+			}
 		}
 		else {
 			vddlog("d", "Created a new processing thread for this monitor.");
@@ -4319,7 +4671,12 @@ void IndirectDeviceContext::AssignSwapChain(IDDCX_MONITOR Monitor, IDDCX_SWAPCHA
 
 void IndirectDeviceContext::UnassignSwapChain(IDDCX_MONITOR Monitor)
 {
-	std::unique_ptr<SwapChainProcessor> processorToStop;
+	// ROUND-2 FIX (Issue 3): shared_ptr slot. Move the processor out under the lock, release the
+	// lock, signal its worker to terminate, then drop our reference. We must SIGNAL here (not rely
+	// on ~SwapChainProcessor) because under the shared_ptr model the destructor may run on the
+	// worker thread, which can't be what wakes the worker. The reference we hold here is dropped
+	// at end of scope OUTSIDE m_ProcessingThreadsMutex.
+	std::shared_ptr<SwapChainProcessor> processorToStop;
 
 	{
 		std::lock_guard<std::mutex> lock(m_ProcessingThreadsMutex);
@@ -4334,6 +4691,9 @@ void IndirectDeviceContext::UnassignSwapChain(IDDCX_MONITOR Monitor)
 	if (processorToStop)
 	{
 		vddlog("i", "Unassigning swapchain for one monitor. Its processing thread will be stopped.");
+		if (processorToStop->m_hTerminateEvent.Get()) {
+			SetEvent(processorToStop->m_hTerminateEvent.Get());
+		}
 	}
 	else
 	{
@@ -4397,6 +4757,13 @@ NTSTATUS VirtualDisplayDriverParseMonitorDescription(const IDARG_IN_PARSEMONITOR
 	logStream << "Parsing monitor description. Input buffer count: " << pInArgs->MonitorModeBufferInputCount;
 	vddlog("d", logStream.str().c_str());
 
+	// ROUND-2 FIX (Issue 2): RebuildKnownMonitorModesCache() CLEARS+REFILLS s_KnownMonitorModes2,
+	// which is then INDEXED below — and the same vector is rebuilt by the description2 callback on
+	// another thread. Hold g_SettingsMutex across the rebuild AND the indexing so the vector cannot
+	// be cleared/reassigned mid-read (container UB). This callback makes NO IddCx call (it only
+	// writes into the OS-supplied pMonitorModes buffer), so holding the lock across the body is
+	// safe and cannot re-enter the driver.
+	std::lock_guard<std::mutex> settingsLk(g_SettingsMutex);
 	RebuildKnownMonitorModesCache();
 	pOutArgs->MonitorModeBufferOutputCount = (UINT)monitorModes.size();
 
@@ -4406,7 +4773,7 @@ NTSTATUS VirtualDisplayDriverParseMonitorDescription(const IDARG_IN_PARSEMONITOR
 
 	if (pInArgs->MonitorModeBufferInputCount < monitorModes.size())
 	{
-		logStream.str(""); 
+		logStream.str("");
 		logStream << "Buffer too small. Input count: " << pInArgs->MonitorModeBufferInputCount << ", Required: " << monitorModes.size();
 		vddlog("w", logStream.str().c_str());
 		// Return success if there was no buffer, since the caller was only asking for a count of modes
@@ -4499,23 +4866,33 @@ void CreateTargetMode2(IDDCX_TARGET_MODE2& Mode, UINT Width, UINT Height, UINT V
 
 	Mode.Size = sizeof(Mode);
 
+	// ROUND-2 FIX (Issue 2): SDRCOLOUR/HDRCOLOUR are written by the SDR10/HDRPLUS pipe handlers on
+	// another thread. READ-lock and snapshot them into locals so the value used below is internally
+	// consistent (no torn scalar). ColourFormat is load-time-only, so it is read without the lock.
+	IDDCX_BITS_PER_COMPONENT sdrColour;
+	IDDCX_BITS_PER_COMPONENT hdrColour;
+	{
+		std::lock_guard<std::mutex> lk(g_SettingsMutex);
+		sdrColour = SDRCOLOUR;
+		hdrColour = HDRCOLOUR;
+	}
 
 	if (ColourFormat == L"RGB") {
-		Mode.BitsPerComponent.Rgb = SDRCOLOUR | HDRCOLOUR;
+		Mode.BitsPerComponent.Rgb = sdrColour | hdrColour;
 	}
 	else if (ColourFormat == L"YCbCr444") {
-		Mode.BitsPerComponent.YCbCr444 = SDRCOLOUR | HDRCOLOUR;
+		Mode.BitsPerComponent.YCbCr444 = sdrColour | hdrColour;
 	}
 	else if (ColourFormat == L"YCbCr422") {
-		Mode.BitsPerComponent.YCbCr422 = SDRCOLOUR | HDRCOLOUR; 
+		Mode.BitsPerComponent.YCbCr422 = sdrColour | hdrColour;
 	}
 	else if (ColourFormat == L"YCbCr420") {
-		Mode.BitsPerComponent.YCbCr420 = SDRCOLOUR | HDRCOLOUR; 
+		Mode.BitsPerComponent.YCbCr420 = sdrColour | hdrColour;
 	}
 	else {
-		Mode.BitsPerComponent.Rgb = SDRCOLOUR | HDRCOLOUR;  // Default to RGB
+		Mode.BitsPerComponent.Rgb = sdrColour | hdrColour;  // Default to RGB
 	}
-	
+
 
 	logStream.str(""); 
 	logStream << "IDDCX_TARGET_MODE2 configured with Size: " << Mode.Size
@@ -4767,6 +5144,12 @@ NTSTATUS VirtualDisplayDriverEvtIddCxParseMonitorDescription2(
 	}
 	vddlog("d", logStream.str().c_str());
 
+	// ROUND-2 FIX (Issue 2): hold g_SettingsMutex across the s_KnownMonitorModes2 rebuild AND the
+	// indexing+scalar reads below (the same vector is rebuilt by the non-2 ParseMonitorDescription
+	// callback, and SDRCOLOUR/HDRCOLOUR are written by the SDR10/HDRPLUS pipe handlers). This
+	// callback makes NO IddCx call (only writes the OS-supplied pMonitorModes buffer), so holding
+	// the lock across the body is safe. ColourFormat is load-time-only (read without the lock).
+	std::lock_guard<std::mutex> settingsLk(g_SettingsMutex);
 	RebuildKnownMonitorModesCache();
 	pOutArgs->MonitorModeBufferOutputCount = (UINT)monitorModes.size();
 
@@ -4782,7 +5165,11 @@ NTSTATUS VirtualDisplayDriverEvtIddCxParseMonitorDescription2(
 			vddlog("e", "pMonitorModes is null but buffer size is sufficient");
 			return STATUS_INVALID_PARAMETER;
 		}
-		
+
+		// Snapshot the raced scalars once (we already hold g_SettingsMutex for the whole body).
+		const IDDCX_BITS_PER_COMPONENT sdrColour = SDRCOLOUR;
+		const IDDCX_BITS_PER_COMPONENT hdrColour = HDRCOLOUR;
+
 		logStream.str(""); // Clear the stream
 		logStream << "Writing monitor modes to output buffer:";
 		for (DWORD ModeIndex = 0; ModeIndex < monitorModes.size(); ModeIndex++)
@@ -4793,20 +5180,20 @@ NTSTATUS VirtualDisplayDriverEvtIddCxParseMonitorDescription2(
 
 
 			if (ColourFormat == L"RGB") {
-				pInArgs->pMonitorModes[ModeIndex].BitsPerComponent.Rgb = SDRCOLOUR | HDRCOLOUR;
-				
+				pInArgs->pMonitorModes[ModeIndex].BitsPerComponent.Rgb = sdrColour | hdrColour;
+
 			}
 			else if (ColourFormat == L"YCbCr444") {
-				pInArgs->pMonitorModes[ModeIndex].BitsPerComponent.YCbCr444 = SDRCOLOUR | HDRCOLOUR;
+				pInArgs->pMonitorModes[ModeIndex].BitsPerComponent.YCbCr444 = sdrColour | hdrColour;
 			}
 			else if (ColourFormat == L"YCbCr422") {
-				pInArgs->pMonitorModes[ModeIndex].BitsPerComponent.YCbCr422 = SDRCOLOUR | HDRCOLOUR;
+				pInArgs->pMonitorModes[ModeIndex].BitsPerComponent.YCbCr422 = sdrColour | hdrColour;
 			}
 			else if (ColourFormat == L"YCbCr420") {
-				pInArgs->pMonitorModes[ModeIndex].BitsPerComponent.YCbCr420 = SDRCOLOUR | HDRCOLOUR;
+				pInArgs->pMonitorModes[ModeIndex].BitsPerComponent.YCbCr420 = sdrColour | hdrColour;
 			}
 			else {
-				pInArgs->pMonitorModes[ModeIndex].BitsPerComponent.Rgb = SDRCOLOUR | HDRCOLOUR;  // Default to RGB
+				pInArgs->pMonitorModes[ModeIndex].BitsPerComponent.Rgb = sdrColour | hdrColour;  // Default to RGB
 			}
 
 
