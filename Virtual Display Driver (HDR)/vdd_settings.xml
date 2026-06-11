@@ -10,7 +10,7 @@
 
     <!-- === BASIC DRIVER CONFIGURATION === -->
     <monitors>
-        <count>1</count>
+        <count>0</count>
     </monitors>
 
     <gpu>
@@ -48,7 +48,7 @@
 
     <!-- === LOGGING CONFIGURATION === -->
     <logging>
-        <SendLogsThroughPipe>true</SendLogsThroughPipe>
+        <SendLogsThroughPipe>false</SendLogsThroughPipe>
         <logging>false</logging>
         <debuglogging>false</debuglogging> <!-- WARNING: Debug logging creates large files -->
     </logging>

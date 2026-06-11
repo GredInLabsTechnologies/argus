@@ -2294,11 +2294,35 @@ void HandleClient(HANDLE hPipe) {
 		g_pipeHandle = hPipe;
 	}
 	vddlog("p", "Client Handling Enabled");
+	// The wire contract (docs/argus-driver-build.md) is ASCII and the Rust broker (istro-svc)
+	// sends ASCII; the legacy upstream companion app sent UTF-16LE. Accept BOTH: read raw bytes
+	// and normalize into the wide buffer the parser below expects. UTF-16LE of any ASCII-range
+	// command always contains 0x00 high bytes; plain ASCII never contains a NUL — that's the
+	// discriminator. Before this, an ASCII "ADD" parsed as one garbage wchar and fell through to
+	// the unknown-command path.
 	wchar_t buffer[128];
+	char raw[256];
 	DWORD bytesRead;
-	BOOL result = ReadFile(hPipe, buffer, sizeof(buffer) - sizeof(wchar_t), &bytesRead, NULL);
+	BOOL result = ReadFile(hPipe, raw, sizeof(raw) - sizeof(wchar_t), &bytesRead, NULL);
 	if (result && bytesRead != 0) {
-		buffer[bytesRead / sizeof(wchar_t)] = L'\0';
+		bool looksWide = false;
+		for (DWORD i = 0; i < bytesRead; ++i) {
+			if (raw[i] == 0) { looksWide = true; break; }
+		}
+		size_t wlen;
+		if (looksWide) {
+			wlen = bytesRead / sizeof(wchar_t);
+			if (wlen > 127) wlen = 127;
+			memcpy(buffer, raw, wlen * sizeof(wchar_t));
+		}
+		else {
+			wlen = bytesRead;
+			if (wlen > 127) wlen = 127;
+			for (size_t i = 0; i < wlen; ++i) {
+				buffer[i] = static_cast<wchar_t>(static_cast<unsigned char>(raw[i]));
+			}
+		}
+		buffer[wlen] = L'\0';
 		wstring bufferwstr(buffer);
 		int bufferSize = WideCharToMultiByte(CP_UTF8, 0, bufferwstr.c_str(), -1, nullptr, 0, nullptr, nullptr);
 		string bufferstr(bufferSize, 0);
@@ -2602,13 +2626,18 @@ void HandleClient(HANDLE hPipe) {
 			vddlog("p", "Heartbeat Ping");
 		}
 		else {
+			// Unknown command: log it SAFELY and answer ERR. The old code called wcstombs_s with
+			// invalid arguments (dst=null, count=0), which trips the CRT invalid-parameter handler
+			// and ABORTS the whole UMDF host on any unrecognized/garbled message — i.e. one bad
+			// pipe message used to "unplug" every live virtual monitor (CM_PROB_FAILED_POST_START).
 			vddlog("e", "Unknown command");
-
-			size_t size_needed;
-			wcstombs_s(&size_needed, nullptr, 0, buffer, 0);
-			std::string narrowString(size_needed, 0);
-			wcstombs_s(nullptr, &narrowString[0], size_needed, buffer, size_needed);
-			vddlog("e", narrowString.c_str());
+			int size_needed = WideCharToMultiByte(CP_UTF8, 0, bufferwstr.c_str(), -1, nullptr, 0, nullptr, nullptr);
+			if (size_needed > 0) {
+				std::string narrowString(size_needed, 0);
+				WideCharToMultiByte(CP_UTF8, 0, bufferwstr.c_str(), -1, &narrowString[0], size_needed, nullptr, nullptr);
+				vddlog("e", narrowString.c_str());
+			}
+			SendToPipe("ERR");
 		}
 	}
 	// Clear g_pipeHandle BEFORE closing the OS handle, under the lock, so no logging thread can
@@ -2618,6 +2647,11 @@ void HandleClient(HANDLE hPipe) {
 		std::lock_guard<std::mutex> lk(g_pipeHandleMutex);
 		g_pipeHandle = INVALID_HANDLE_VALUE; // stop all threads from using this client reply channel
 	}
+	// FlushFileBuffers BEFORE DisconnectNamedPipe: Disconnect DISCARDS unread data, so a reply
+	// written microseconds earlier (PONG/OK/index) silently vanished if the client hadn't posted
+	// its read yet — the broker then saw an empty response and treated the op as failed. Flush
+	// blocks until the client has consumed what we wrote.
+	FlushFileBuffers(hPipe);
 	DisconnectNamedPipe(hPipe);
 	CloseHandle(hPipe);
 }
@@ -2956,15 +2990,21 @@ void loadSettings() {
 					return;
 				}
 				if (currentElement == L"count") {
-					monitorcount = stoi(wstring(pwszValue, cwchValue));
-					// Idle-at-0: a count of 0 is now VALID and means "start with no monitors;
-					// the broker will ADD them on demand". Previously this was forced to 1.
-					if (monitorcount < 0) {
+					// stoi() devuelve int; validamos en SIGNED antes de asignar. monitorcount es
+					// unsigned → `monitorcount < 0` sería siempre falso (C4296) Y un negativo haría
+					// WRAP a un valor enorme en vez de clamp. Por eso parseamos a int y comprobamos ahí.
+					int parsed = stoi(wstring(pwszValue, cwchValue));
+					// Idle-at-0: un count de 0 es VÁLIDO = "empieza sin monitores; el broker los ADD
+					// on-demand". Un negativo en config se clampa a 0 (antes se forzaba a 1).
+					if (parsed < 0) {
 						monitorcount = 0;
 						vddlog("w", "Negative monitor count in config; clamped to 0 (idle).");
 					}
-					else if (monitorcount == 0) {
-						vddlog("i", "Monitor count is 0: adapter will idle with no monitors (on-demand).");
+					else {
+						monitorcount = parsed;
+						if (monitorcount == 0) {
+							vddlog("i", "Monitor count is 0: adapter will idle with no monitors (on-demand).");
+						}
 					}
 				}
 				else if (currentElement == L"friendlyname") {
