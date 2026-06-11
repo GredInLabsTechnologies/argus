@@ -3552,6 +3552,21 @@ void SwapChainProcessor::Start()
 	}
 }
 
+// Señala el terminate y espera al worker (salvo auto-llamada desde el propio worker). Ver el
+// comentario en Driver.h: el join ANTES de devolver el control a IddCx es lo que garantiza que el
+// WdfObjectDelete(m_hSwapChain) del worker ocurra mientras el objeto WDF sigue vivo.
+void SwapChainProcessor::StopAndJoin()
+{
+	if (m_hTerminateEvent.Get())
+	{
+		SetEvent(m_hTerminateEvent.Get());
+	}
+	if (m_hThread.Get() && m_ThreadId != 0 && m_ThreadId != GetCurrentThreadId())
+	{
+		WaitForSingleObject(m_hThread.Get(), INFINITE);
+	}
+}
+
 SwapChainProcessor::~SwapChainProcessor()
 {
 	stringstream logStream;
@@ -4181,16 +4196,16 @@ IndirectDeviceContext::~IndirectDeviceContext()
 		processingThreads.swap(m_ProcessingThreads);
 	}
 
-	// ROUND-2 FIX (Issue 3): signal every remaining worker to terminate BEFORE the local map drops
-	// its references (done OUTSIDE m_ProcessingThreadsMutex). We must signal rather than rely on
-	// ~SwapChainProcessor, because under the shared_ptr model a worker may hold the last reference
-	// and the destructor would then run on the worker thread (which can't be what wakes it). After
-	// signaling, the local map clearing releases our references; any still-running worker stays
-	// alive via its own hold until it exits and tears itself down. (In practice STEP 3's
-	// RemoveAllMonitors already unassigned most/all via IddCxMonitorDeparture -> UnassignSwapChain.)
+	// Stop AND JOIN every remaining worker BEFORE the device context dies (done OUTSIDE
+	// m_ProcessingThreadsMutex). Signal-sin-join dejaba workers drenando durante el teardown del
+	// device: su WdfObjectDelete tardío sobre swapchains ya liberados por WDF corrompía el heap
+	// del WUDFHost (AV en cada disable/restart del devnode). Este destructor corre en el hilo de
+	// teardown de WDF, nunca en un worker, así que el join es seguro (y StopAndJoin se salta el
+	// self-join por si acaso). En la práctica STEP 3 ya desasignó la mayoría via
+	// IddCxMonitorDeparture -> UnassignSwapChain, que ahora también joinea.
 	for (auto& kv : processingThreads) {
-		if (kv.second && kv.second->m_hTerminateEvent.Get()) {
-			SetEvent(kv.second->m_hTerminateEvent.Get());
+		if (kv.second) {
+			kv.second->StopAndJoin();
 		}
 	}
 
@@ -4643,16 +4658,15 @@ void IndirectDeviceContext::AssignSwapChain(IDDCX_MONITOR Monitor, IDDCX_SWAPCHA
 			processorSlot = newProcessor;
 		}
 
-		// If we replaced an existing processor, signal its worker to terminate BEFORE we drop our
-		// reference. Under the shared_ptr model the destructor is NOT guaranteed to run on this
-		// thread (the worker may hold the last reference), so we cannot rely on ~SwapChainProcessor
-		// to signal termination — we must do it here so the old worker actually wakes and exits.
-		// This is done OUTSIDE m_ProcessingThreadsMutex (the lock-discipline rule for teardown).
+		// If we replaced an existing processor, stop AND JOIN its worker BEFORE returning to
+		// IddCx. Signal-without-join dejaba al worker viejo drenando mientras IddCx destruía el
+		// swapchain antiguo (hijo del monitor) → su WdfObjectDelete tardío tocaba un FxObject
+		// liberado → AV en WUDFHost (el crash de sesión en vivo en cada cambio de modo). Hecho
+		// FUERA de m_ProcessingThreadsMutex (regla de teardown); este hilo es de IddCx, nunca el
+		// worker, así que el join es seguro.
 		if (previousProcessor) {
 			vddlog("d", "Replaced existing processing thread for this monitor only.");
-			if (previousProcessor->m_hTerminateEvent.Get()) {
-				SetEvent(previousProcessor->m_hTerminateEvent.Get());
-			}
+			previousProcessor->StopAndJoin();
 		}
 		else {
 			vddlog("d", "Created a new processing thread for this monitor.");
@@ -4731,9 +4745,10 @@ void IndirectDeviceContext::UnassignSwapChain(IDDCX_MONITOR Monitor)
 	if (processorToStop)
 	{
 		vddlog("i", "Unassigning swapchain for one monitor. Its processing thread will be stopped.");
-		if (processorToStop->m_hTerminateEvent.Get()) {
-			SetEvent(processorToStop->m_hTerminateEvent.Get());
-		}
+		// JOIN antes de devolver el control a IddCx: tras este callback, IddCx sigue con el
+		// departure y WDF libera el objeto swapchain. Sin join, el worker hacía su
+		// WdfObjectDelete sobre el objeto ya liberado → AV (crash del WUDFHost).
+		processorToStop->StopAndJoin();
 	}
 	else
 	{

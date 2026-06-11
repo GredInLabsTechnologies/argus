@@ -98,6 +98,17 @@ namespace Microsoft
             // valid once a shared_ptr owns the object.
             void Start();
 
+            // Signals the worker to terminate and JOINS it (skips the join if called on the worker
+            // itself). MUST be called from Unassign/replace/device-teardown BEFORE returning to
+            // IddCx: the worker's exit path calls WdfObjectDelete(m_hSwapChain), and the swapchain
+            // WDF object is a child of the monitor — once the callback returns, IddCx proceeds
+            // with departure/teardown and WDF frees that object. A worker still draining would
+            // then delete a FREED FxObject (AV in its critical section = the WUDFHost crash that
+            // killed live sessions and fired on every device restart). Joining here guarantees the
+            // worker's delete lands while the object is still valid — same contract as the MS
+            // IddSampleDriver, which joins inside the processor destructor invoked from Unassign.
+            void StopAndJoin();
+
         private:
             static DWORD CALLBACK RunThread(LPVOID Argument);
 
