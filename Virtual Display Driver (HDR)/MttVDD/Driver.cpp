@@ -2730,6 +2730,14 @@ void StopNamedPipeServer() {
 		g_Running = false;
 	}
 	if (hPipeThread) {
+		// El hilo del servidor puede estar BLOQUEADO en ConnectNamedPipe (sin clientes) o en
+		// ReadFile (cliente conectado que no escribe). El "poke" de abajo solo despierta el
+		// primer caso y ademas pierde la carrera si un cliente real consume la instancia en
+		// escucha. CancelSynchronousIo aborta la E/S sincrona pendiente del hilo directamente
+		// (ERROR_OPERATION_ABORTED) -> el bucle ve g_Running=false y sale. Sin esto, el unload
+		// colgaba hasta que el watchdog de WUDF (60 s) MATABA el WUDFHost, dejando el driver
+		// zombi y el siguiente ADD colgado.
+		CancelSynchronousIo(hPipeThread);
 		HANDLE hPipe = CreateFileW(
 			PIPE_NAME,
 			GENERIC_READ | GENERIC_WRITE,
