@@ -41,9 +41,11 @@ jobs:
       # This is how Microsoft's own Windows-driver-samples build on GitHub Actions runners, which ship
       # an SDK but not a matching WDK. The restored packages are picked up by Directory.Build.props in
       # the project directory (conditional imports — local EWDK builds are unaffected).
+      # Restore under the repo ROOT (no parentheses): the WDK MSBuild task assembly fails to load
+      # from a path containing '(' — see Directory.Build.props.
       - name: Restore WDK/SDK NuGet packages (IddCx.h + driver toolset)
         shell: pwsh
-        run: nuget restore "${{ env.VDD_DIR }}/packages.config" -PackagesDirectory "${{ env.VDD_DIR }}/packages"
+        run: nuget restore packages.config -PackagesDirectory packages
 
       - name: Build VDD (${{ matrix.platform }})
         shell: pwsh
