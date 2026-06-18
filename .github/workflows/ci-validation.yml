@@ -52,11 +52,14 @@ jobs:
       - name: Add WDK build tools to PATH
         shell: pwsh
         run: |
-          $bin = Get-ChildItem "packages\Microsoft.Windows.WDK.x64.*\bin\*\x64" -Directory -ErrorAction SilentlyContinue |
-                 Sort-Object FullName -Descending | Select-Object -First 1
-          if (-not $bin) { throw "WDK bin (stampinf) not found under packages\Microsoft.Windows.WDK.x64.*\bin\*\x64" }
-          Write-Output "WDK tools bin: $($bin.FullName)"
-          Add-Content -Path $env:GITHUB_PATH -Value $bin.FullName
+          # Locate stampinf.exe wherever the WDK NuGet package places it (its content lives under
+          # a 'c\' subfolder; layout varies by version), and add that folder to PATH. inf2cat/makecat
+          # live alongside it.
+          $tool = Get-ChildItem "packages\Microsoft.Windows.WDK.x64.*" -Recurse -Filter "stampinf.exe" -File -ErrorAction SilentlyContinue |
+                  Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $tool) { throw "stampinf.exe not found anywhere under packages\Microsoft.Windows.WDK.x64.*" }
+          Write-Output "WDK tools bin: $($tool.DirectoryName)"
+          Add-Content -Path $env:GITHUB_PATH -Value $tool.DirectoryName
 
       - name: Build VDD (${{ matrix.platform }})
         shell: pwsh
