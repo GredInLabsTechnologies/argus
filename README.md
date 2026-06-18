@@ -1,164 +1,96 @@
-# 🛠️ Virtual Display Driver Development Team
+<div align="center">
 
-| 👤 Developer          | 🏷️ Role                            | 💖 Support Us                                                                                                         |
-| --------------------- | ----------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| **[MikeTheTech](https://github.com/itsmikethetech)** | Project Manager, Lead Programmer | [Patreon](https://www.patreon.com/mikethetech) :gem: / [GitHub Sponsors](https://github.com/sponsors/itsmikethetech/) 💖  |
-| **[Jocke](https://github.com/zjoasan)**       | Programmer, Concept Design  | [GitHub Sponsors ](https://github.com/sponsors/zjoasan) 💖                                                             |
+# Argus
 
-:bulb: *We appreciate your support—every contribution helps us keep building amazing experiences!*
+### A Windows virtual display that appears and disappears on demand — in milliseconds, with no adapter reload.
 
-# <img src="https://github.com/user-attachments/assets/22ff37ba-a8ea-4b65-b7b2-e7fcb09d858b" height="32" width="32"></img> Virtual Display Driver
-This project creates a _virtual monitor_ in Windows that functions just like a physical display. It is particularly useful for applications such as **streaming, virtual reality, screen recording,** and **headless servers—systems** that operate without a physical display attached. 
+**An open-source Indirect Display Driver (IddCx) by [Gred In Labs Technologies](https://github.com/GredInLabsTechnologies)**
 
-Unlike traditional monitors, this virtual display supports custom resolutions and refresh rates beyond hardware limitations—offering greater flexibility for advanced setups. You can also use custom EDIDs to simulate or emulate existing hardware displays.
+[![Build](https://github.com/GredInLabsTechnologies/argus/actions/workflows/ci-validation.yml/badge.svg)](https://github.com/GredInLabsTechnologies/argus/actions)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Fork of Virtual-Display-Driver](https://img.shields.io/badge/fork%20of-VirtualDrivers%2FVirtual--Display--Driver-informational)](https://github.com/VirtualDrivers/Virtual-Display-Driver)
 
-# Check out our other Software!
+</div>
 
-| 💻 Software | 📝 What It Does |
-| ----------- | --------------- |
-| [Linux Virtual Display Driver](https://github.com/VirtualDrivers/Linux-Virtual-Display-Driver) | Add virtual monitors to Linux for streaming, OBS, Sunshine, and desktop sharing workflows. |
-| [Virtual Audio Driver](https://github.com/VirtualDrivers/Virtual-Audio-Driver) | Add virtual speaker and microphone devices to Windows 10/11. |
-| [Virtual Driver Control](https://github.com/VirtualDrivers/Virtual-Driver-Control) | Control and configure VirtualDrivers tools from a unified app/interface. |
-| [VirtualBT](https://github.com/VirtualDrivers/VirtualBT) | A Windows Bluetooth server for simulating input devices like keyboards, mice, and gamepads. Still very early and not fully functional. |
-| **[BurnBin](https://burnb.in)** | A portable Windows file-sharing tool that turns your own PC into a temporary file drop. Share files with short-lived public links, optional return uploads, endpoint health checks, managed BurnBin links, Cloudflared fallback links, and Direct IP sharing when available. |
-| **[FireFetch](https://firefetch.app)** | A private media-saving app for building an offline library from videos, songs, playlists, torrents, and direct files. It uses tools like yt-dlp, FFmpeg, aria2c, MusicBrainz, YouTube Music metadata, and local indexing to save, queue, organize, and browse media without cloud lock-in or AI-generated recommendations. |
-| **[InfinitePIP](https://infinitepip.app)** | An always-on-top desktop picture-in-picture tool that turns live screens, app windows, and custom regions into borderless floating windows. Create multiple PiPs, pan, zoom, adjust opacity, keep captures above other windows, and even run virtual monitors from Virtual Display Driver inside floating PiP views. |
-| **[BurnFlix](https://burnflix.app)** | A local-first media server that turns movies, shows, personal videos, games, and apps into one polished, living room-ready library. It loads from an offline cache, scans in the background, enriches metadata with providers like TMDB, OMDb, TheTVDB, Steam, Libretro, and IGDB, and keeps artwork, recommendations, and library health local. |
+---
 
-Explore more games, tools, apps, and experiments from PyroSoft: **[Visit PyroSoft.Pro](https://pyrosoft.pro)**
+## What it is
 
-## 🧾 Changelog (recent)
+Argus turns a Windows PC into a machine that can grow a **real extra monitor out of thin air** — no
+cable, no hardware, no second GPU output. The monitor behaves exactly like a physical one (Windows can
+extend the desktop to it, drag windows onto it, set its resolution), except it lives entirely in
+software and can be **summoned and dismissed instantly**.
 
-- **PCI-bus based GPU selection (LUID)**: Improved multi-GPU render adapter selection by resolving an adapter **LUID from a PCI bus number** (more deterministic than name-only matching).
-- **Device/PCI-slot friendly naming**: Improved device identification / friendly naming using DeviceID and PCI slot info.
-- **GetIddCx helper tool**: Added source for the `GetIddCx` utility to query IddCx versions.
-- **EDID integration**: Added EDID integration support for custom/virtual monitor profiles.
-- **Performance optimization**: Driver performance improvements (various internal optimizations).
+It is the virtual-display engine behind the **Istro** project, where that on-demand monitor is streamed
+over Wi‑Fi to a tablet — so any screen you have lying around becomes a true second display for your PC,
+appearing the moment you connect and vanishing the moment you leave.
 
-## ⬇️ Download Latest Version
+## Why it exists — what makes it different
 
-- [Driver Installer (Windows 10/11)](https://github.com/VirtualDrivers/Virtual-Display-Driver/releases) - Check the [Releases](https://github.com/VirtualDrivers/Virtual-Display-Driver/releases) page for the latest version and release notes.
-- **Winget:** `winget install --id=VirtualDrivers.Virtual-Display-Driver -e`
+Argus is a fork of the excellent [VirtualDrivers/Virtual-Display-Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver)
+(MttVDD). The upstream is a fantastic, widely-used VDD — but it follows a **fixed-count-at-boot** model:
+you declare how many virtual monitors exist, and changing that count means **reloading the whole
+adapter**. That's a visible, disruptive operation.
 
-> [!IMPORTANT]
-> Before using the Virtual Display Driver, ensure the following dependencies are installed:
-> - **Microsoft Visual C++ Redistributable**  
->   If you encounter the error `vcruntime140.dll not found`, download and install the latest version from the [Microsoft Visual C++ Redistributable page](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170).
->
-> **Driver update safety:** If you're about to install **major GPU/chipset driver updates**, uninstall VDD first. If you get a black screen or display priority gets scrambled, boot into **Safe Mode** and uninstall VDD to recover.
+Argus rebuilds the lifecycle around a **spacedesk-style on-demand model**:
 
+- **Idle at zero.** The adapter is always present but starts with **0 monitors**. It costs nothing and
+  clutters nothing until something actually asks for a screen.
+- **Add / remove one monitor by index, live.** A controller asks for a monitor and one **arrives in
+  milliseconds** via `IddCxMonitorArrival`; it asks to release it and it **departs** via
+  `IddCxMonitorDeparture` — **with no adapter reload**, no flicker on your other displays, no
+  re-enumeration storm.
+- **Self-healing.** A tiny control protocol (`ADD` → index, `REMOVE <index>` → ok, `PING` → pong) drives
+  it. If the controller crashes and stops pinging, a watchdog auto-retires the orphaned monitors so you
+  never end up with ghost screens — yet a standalone install with no controller keeps its monitors
+  forever. Opt-in robustness, no surprises.
 
-## 🛠️ Installation
+## The hard part (the part we're proud of)
 
-- Step 1: Download the Virtual Driver Control app.
-   - You can download the installer directly from the [Releases](https://github.com/VirtualDrivers/Virtual-Display-Driver/releases) page.
+Hot-plugging monitors *correctly* on IddCx is genuinely tricky, because the framework's teardown path
+(`UnassignSwapChain`) and the driver's own monitor lock can **deadlock each other** if you're naïve
+about it. Argus calls `IddCxMonitorDeparture` **outside** the monitors lock and keeps a strictly
+**acyclic lock order** (`device → monitors`, departure outside the lock), documented right in the code.
+The result is add/remove that's instant *and* free of the self-deadlock this API invites. The control
+pipe is also hardened (SDDL restricted to SYSTEM + Administrators, not "Everyone").
 
-- Step 2: Extract to a folder and run the app
-   - Launch the VDC.
-   - Click the Install button.
+This is the kind of detail that doesn't show up in a screenshot but is the difference between a demo and
+something you'd actually run.
 
-- Step 3: Verify the Installation (Optional)
-   - Check if the Virtual Display Driver is correctly installed by running the following:
-   - **Device Manager:** Check "Device Manager" under "Display Adapters."
-   - **Settings:** Check display settings under system settings and see if the virtual displays show.
+## Building
 
-While VDC is a good and friendly way to work with VDD, you can also do a a lot manually. Like adding or removing resolutions or enable/disable 
-functions, which is done by editing vdd_settings.xml. You should be able to locate the file at the default location: 
-```C:\VirtualDisplayDriver\vdd_settings.xml ```
+Argus is a user-mode UMDF/IddCx driver. It builds with the **Enterprise WDK (EWDK)** without installing
+Visual Studio, or in CI via the public [GitHub Actions workflow](.github/workflows/ci-validation.yml)
+(reproducible from source). Build notes live in [`docs/`](docs/).
 
-For more information about manual installation, uninstallation and "personalization", please check out the [Wiki](https://github.com/VirtualDrivers/Virtual-Display-Driver/wiki) here on 
-the project GitHub repository. If you are into tinkering, check out the Powershell scripts in [Community scripts](https://github.com/VirtualDrivers/Virtual-Display-Driver/tree/master/Community%20Scripts).
+## Signing
 
-## 🤔 Comparison with other IDDs
+Releases are signed with **Authenticode (OV)** so the driver loads without enabling test-signing.
+Argus is user-mode, so it does **not** require kernel attestation/EV. See
+[`docs/SIGNING.md`](docs/SIGNING.md) for the full policy and verification steps.
 
-The table below shows a comparison with other popular Indirect Display Driver
-projects.
+## Credits & attribution
 
-| Project | Iddcx version | Signed | SDR | HDR | H-Cursor | Tweakable | ARM64 Support | Custom EDID | Floating Point Refresh Rates |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| [Virtual-Display-Driver (HDR)] | 1.10 (latest) | ✅ | ✅ (8/10bit) | ✅ (10/12bit) | ✅ | ✅ | ✅¹ | ✅ | ✅ |
-| [usbmmid_v2] |  | ✅ | ✅ (8bit) |  |  |  |  |  |  |
-| [virtual-display-rs] | 1.5 |  | ✅ (8bit) |  | ✅ | ✅ |  |  |  |
-| [parsec-vdd]| 1.5 | ✅ | ✅ (8bit) |  | ✅ | ✅ |  |  |  |
-| [lddSampleDriver] | 1.2 |  | ✅ (8bit) |  |  |  |  |  |  |
-| [RustDesklddDriver] | 1.2 |  | ✅ (8bit) |  |  |  |  |  |  |
+Argus stands on excellent shoulders, and we keep the credit where it belongs:
 
-¹ ARM64 Support in Windows 11 24H2 or later may require test signing be enabled.
+- **[VirtualDrivers/Virtual-Display-Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver)**
+  ([MikeTheTech](https://github.com/itsmikethetech), [Jocke](https://github.com/zjoasan) and
+  contributors) — the upstream MttVDD that Argus forks. HDR, EDID, the core IddCx driver: theirs.
+- **[SudoMaker / SudoVDA](https://github.com/SudoMaker)** — the on-demand add/remove-by-index pattern
+  that inspired Argus's runtime model (MIT/CC0).
+- **[Microsoft IndirectDisplay sample](https://github.com/microsoft/Windows-driver-samples/tree/master/video/IndirectDisplay)**
+  — the IddCx foundation.
 
-HDR Support Now Available for Windows 11 23H2+ 
+What Gred In Labs adds: the **idle-at-0 + live, deadlock-free, per-index monitor hotplug**, the hardened
+control protocol with watchdog self-heal, and the integration as Istro's virtual-display engine.
 
-## ▶️ Videos and Tutorials
+## License
 
-### Installation Video
+[MIT](LICENSE). Upstream copyright (© 2024 Virtual Display) is preserved; Argus modifications © 2026
+Gred In Labs Technologies. A fork that honors the original.
 
-[![Thumbnail24 (1)](https://github.com/user-attachments/assets/383d840c-8327-439b-a89b-84b271320371)](https://youtu.be/jN5YnHlC0fE)
+---
 
-![Powerpoint](https://github.com/user-attachments/assets/9ac05776-36e1-4ba1-ac52-3f189dbd7730)
-
-## Troubleshooting 
-### ⚠️ Important: GPU/Chipset Driver Updates
-
-VDD can conflict with major driver updates, causing display priority issues or black screens on boot.
-
-**Before Updating Drivers**
-
-If you're planning to update GPU or chipset drivers:
-1. Uninstall VDD first (via VDC app or Device Manager)
-2. Complete your driver update
-3. Reinstall VDD
-
-**If You're Stuck at Black Screen**
-
-*Boot into Safe Mode:*
-* Force shutdown 2-3 times until Windows Recovery appears
-* Choose: Troubleshoot → Advanced Options → Startup Settings → Restart → F4 (Safe Mode)
-
-*Remove VDD:*
-* Open Device Manager in Safe Mode
-* Expand Display Adapters → Uninstall Virtual Display Driver
-* Restart normally
-
-*Quick Fix Alternative:*
-* Press `Win + P` at black screen
-* Press ↓ arrow and Enter multiple times to cycle display modes
-
-**Why This Happens**
-
-During driver updates, Windows re-enumerates display devices and may prioritize the virtual display over your physical monitor. Since VDD has no physical screen attached, this results in a black screen even though Windows is running normally.
-
-## 🤝 Sponsors
-
-<table>
-  <tr>
-    <td><img src="https://github.com/user-attachments/assets/ca93d971-67dc-41dd-b945-ab4f372ea72a" /></td>
-    <td>Free code signing on Windows provided by <a href="https://signpath.io">SignPath.io</a>, certificate by <a href="https://signpath.org">SignPath Foundation</a></td>
-  </tr>
-</table>
-
-<table>
-  <tr>
-    <td>Advanced 32bit IEEE Float Audio brought to you by **Lune Studios**.</td>
-  </tr>
-</table>
-
-## Acknowledgements
-
-- Special thanks to **[@ye4241](https://github.com/ye4241)** for submitting the package to Microsoft (WinGet).
-
-- Shoutout to **[MikeTheTech](https://github.com/itsmikethetech)** Project Manager, Owner, and Programmer
-- Shoutout to **[zjoasan](https://github.com/zjoasan)** Programmer. For scripts, EDID integration, and parts of installer.
-- Shoutout to **[Bud](https://github.com/bud3699)** Former Lead Programmer, has since left the project.
-- Shoutout to **[Roshkins](https://github.com/roshkins/IddSampleDriver)** for the original repo.
-- Shoutout to **[Baloukj](https://github.com/baloukj/IddSampleDriver)** for the 8-bit / 10-bit support. (Also, first to push the new Microsoft Driver public!)
-- Shoutout to **[Anakngtokwa](https://github.com/Anakngtokwa)** for assisting with finding driver sources.
-- **[Microsoft](https://github.com/microsoft/Windows-driver-samples/tree/master/video/IndirectDisplay)** Indirect Display Driver/Sample (Driver code)
-- Thanks to **[AKATrevorJay](https://github.com/akatrevorjay/edid-generator)** for the hi-res EDID.
-- Shoutout to **[LexTrack](https://github.com/lextrack/)** for the MiniScreenRecorder script. 
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=VirtualDrivers/Virtual-Display-Driver&type=Date)](https://www.star-history.com/#VirtualDrivers/Virtual-Display-Driver&Date)
-
-## Disclaimer:
-
-This software is provided "AS IS" with NO IMPLICIT OR EXPLICIT warranty. It's worth noting that while this software functioned without issues on our systems, there is no guarantee that it will not impact your computer. It operates in User Mode(Session0), which reduces the likelihood of causing system instability, such as the Blue Screen of Death. However, exercise caution when using this software.
+<div align="center">
+<sub>Free code signing on Windows provided by <a href="https://signpath.io">SignPath.io</a>, certificate by <a href="https://signpath.org">SignPath Foundation</a>.</sub>
+</div>
