@@ -13,6 +13,7 @@ on:
 
 env:
   BUILD_CONFIGURATION: Release
+  VDD_DIR: Virtual Display Driver (HDR)
   VDD_SOLUTION: Virtual Display Driver (HDR)/MttVDD.sln
 
 permissions:
@@ -33,93 +34,29 @@ jobs:
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
 
-      - name: Install Windows Driver Kit (IddCx headers)
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v2
+
+      # Provision the WDK + SDK headers (IddCx.h) and the WindowsUserModeDriver10.0 toolset via NuGet.
+      # This is how Microsoft's own Windows-driver-samples build on GitHub Actions runners, which ship
+      # an SDK but not a matching WDK. The restored packages are picked up by Directory.Build.props in
+      # the project directory (conditional imports — local EWDK builds are unaffected).
+      - name: Restore WDK/SDK NuGet packages (IddCx.h + driver toolset)
         shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          choco install windowsdriverkit11 -y --no-progress
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Detect Windows SDK (windows.h)
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $kitsRoot = $null
-          try {
-            $kitsRoot = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots" -Name "KitsRoot10" -ErrorAction Stop).KitsRoot10
-          } catch {
-            $kitsRoot = Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\"
-          }
-
-          if (-not $kitsRoot -or -not (Test-Path $kitsRoot)) {
-            throw "Windows Kits root not found: $kitsRoot"
-          }
-
-          $includeRoot = Join-Path $kitsRoot "Include"
-          if (-not (Test-Path $includeRoot)) {
-            throw "Windows Kits Include directory not found: $includeRoot"
-          }
-
-          $best =
-            Get-ChildItem -Path $includeRoot -Directory -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
-            Where-Object { Test-Path (Join-Path $_.FullName "um\Windows.h") } |
-            Sort-Object -Property Name -Descending |
-            Select-Object -First 1
-
-          if (-not $best) {
-            throw "Could not find an SDK version directory containing um\\Windows.h under: $includeRoot"
-          }
-
-          $sdkVersion = $best.Name
-          Write-Output "Using WindowsSdkDir: $kitsRoot"
-          Write-Output "Using WindowsTargetPlatformVersion: $sdkVersion"
-          "WINDOWS_SDK_DIR=$kitsRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "WINDOWS_TARGET_PLATFORM_VERSION=$sdkVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        run: nuget restore "${{ env.VDD_DIR }}/packages.config" -PackagesDirectory "${{ env.VDD_DIR }}/packages"
 
       - name: Build VDD (${{ matrix.platform }})
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-
           $sln = "${{ env.VDD_SOLUTION }}"
           if (-not (Test-Path $sln)) { throw "VDD solution file not found at: $sln" }
-
-          # Pick an available UMDF WDF header version on the runner.
-          # Kits can be laid out either versioned:
-          #   Include\<sdk>\wdf\umdf\2.xx
-          # or unversioned:
-          #   Include\wdf\umdf\2.xx
-          $umdfRoots = @(
-            (Join-Path $env:WINDOWS_SDK_DIR ("Include\" + $env:WINDOWS_TARGET_PLATFORM_VERSION + "\wdf\umdf")),
-            (Join-Path $env:WINDOWS_SDK_DIR "Include\wdf\umdf")
-          ) | Where-Object { Test-Path $_ }
-
-          if (-not $umdfRoots -or $umdfRoots.Count -eq 0) {
-            throw "UMDF WDF include root not found under $env:WINDOWS_SDK_DIR (tried versioned + unversioned layouts)"
-          }
-
-          $umdfBest =
-            $umdfRoots |
-            ForEach-Object { Get-ChildItem -Path $_ -Directory -ErrorAction SilentlyContinue } |
-            Where-Object { $_.Name -match '^\d+\.\d+$' } |
-            Sort-Object -Property Name -Descending |
-            Select-Object -First 1
-
-          if (-not $umdfBest) { throw "No UMDF version directories found under: $($umdfRoots -join ', ')" }
-
-          $umdfMinor = ($umdfBest.Name -split '\.')[1]
-          Write-Output "Using UMDF version: $($umdfBest.Name) (minor=$umdfMinor) from $($umdfBest.FullName)"
 
           msbuild $sln `
             /m `
             /t:Build `
             /p:Configuration="${{ env.BUILD_CONFIGURATION }}" `
             /p:Platform="${{ matrix.platform }}" `
-            /p:WindowsSdkDir="$env:WINDOWS_SDK_DIR" `
-            /p:WindowsTargetPlatformVersion="$env:WINDOWS_TARGET_PLATFORM_VERSION" `
-            /p:UMDF_VERSION_MINOR="$umdfMinor" `
             /p:EnableInfVerif=false `
             /p:RunApiValidator=false `
             /verbosity:minimal
@@ -128,7 +65,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $outDir = "Virtual Display Driver (HDR)\${{ matrix.platform }}\${{ env.BUILD_CONFIGURATION }}\MttVDD"
+          $outDir = "${{ env.VDD_DIR }}\${{ matrix.platform }}\${{ env.BUILD_CONFIGURATION }}\MttVDD"
           if (-not (Test-Path $outDir)) { throw "Build output directory not found: $outDir" }
 
           $dest = "artifacts\VDD\${{ matrix.platform }}"
@@ -144,15 +81,8 @@ jobs:
           if-no-files-found: error
 
       # ── Firma de producción del driver (SignPath Foundation, OV Authenticode, gratis para OSS) ──
-      # El driver es user-mode (UMDF/IddCx); el catálogo (mttvdd.cat) se re-firma para reemplazar el
-      # WDKTestCert local (que solo carga con test-signing y que el broker istro-svc rechaza).
-      #
-      # CONDICIONAL: solo corre cuando el proyecto ya está dado de alta en SignPath y los secrets/vars
-      # existen. Hasta entonces el CI sigue compilando sin romperse. Setup en docs/SIGNING.md.
-      #   - secret  SIGNPATH_API_TOKEN          (token de CI de SignPath)
-      #   - var     SIGNPATH_ORGANIZATION_ID    (GUID de la organización en SignPath)
-      # En SignPath hay que crear: project-slug `argus`, una artifact-configuration que firme el .cat,
-      # y las signing-policies `test-signing` / `release-signing`.
+      # Condicional: solo corre cuando el proyecto ya está dado de alta en SignPath y los secrets/vars
+      # existen. Hasta entonces el CI compila sin romperse. Setup en docs/SIGNING.md.
       - name: Sign driver catalog (SignPath)
         if: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
         uses: signpath/github-action-submit-signing-request@v2
@@ -175,4 +105,3 @@ jobs:
           name: VDD-${{ matrix.platform }}-${{ env.BUILD_CONFIGURATION }}-SIGNED
           path: artifacts/VDD/${{ matrix.platform }}-signed/
           if-no-files-found: error
-
