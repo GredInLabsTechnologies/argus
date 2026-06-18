@@ -135,10 +135,44 @@ jobs:
           New-Item -ItemType Directory -Path $dest -Force | Out-Null
           Copy-Item "$outDir\*" -Destination $dest -Recurse -Force
 
-      - name: Upload artifacts
+      - name: Upload artifacts (unsigned)
+        id: upload-unsigned
         uses: actions/upload-artifact@v4
         with:
           name: VDD-${{ matrix.platform }}-${{ env.BUILD_CONFIGURATION }}
           path: artifacts/VDD/${{ matrix.platform }}/
+          if-no-files-found: error
+
+      # ── Firma de producción del driver (SignPath Foundation, OV Authenticode, gratis para OSS) ──
+      # El driver es user-mode (UMDF/IddCx); el catálogo (mttvdd.cat) se re-firma para reemplazar el
+      # WDKTestCert local (que solo carga con test-signing y que el broker istro-svc rechaza).
+      #
+      # CONDICIONAL: solo corre cuando el proyecto ya está dado de alta en SignPath y los secrets/vars
+      # existen. Hasta entonces el CI sigue compilando sin romperse. Setup en docs/SIGNING.md.
+      #   - secret  SIGNPATH_API_TOKEN          (token de CI de SignPath)
+      #   - var     SIGNPATH_ORGANIZATION_ID    (GUID de la organización en SignPath)
+      # En SignPath hay que crear: project-slug `argus`, una artifact-configuration que firme el .cat,
+      # y las signing-policies `test-signing` / `release-signing`.
+      - name: Sign driver catalog (SignPath)
+        if: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
+        uses: signpath/github-action-submit-signing-request@v2
+        with:
+          api-token: '${{ secrets.SIGNPATH_API_TOKEN }}'
+          organization-id: '${{ vars.SIGNPATH_ORGANIZATION_ID }}'
+          project-slug: 'argus'
+          artifact-configuration-slug: 'driver-cat'
+          signing-policy-slug: >-
+            ${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+              && 'release-signing' || 'test-signing' }}
+          github-artifact-id: '${{ steps.upload-unsigned.outputs.artifact-id }}'
+          wait-for-completion: true
+          output-artifact-directory: 'artifacts/VDD/${{ matrix.platform }}-signed'
+
+      - name: Upload artifacts (SIGNED)
+        if: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: VDD-${{ matrix.platform }}-${{ env.BUILD_CONFIGURATION }}-SIGNED
+          path: artifacts/VDD/${{ matrix.platform }}-signed/
           if-no-files-found: error
 
