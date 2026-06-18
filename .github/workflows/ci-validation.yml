@@ -48,6 +48,27 @@ jobs:
         shell: pwsh
         run: nuget restore packages.config -PackagesDirectory packages
 
+      # With the WDK supplied via NuGet (rather than the runner's installed WDK that a full VS dev
+      # shell would expose), MSBuild can't locate stampinf.exe (TRK0005). Point the .inf-stamping
+      # tools at the NuGet bin explicitly: stampinf in c\bin\<ver>\x64, Inf2Cat in x86. The WDK
+      # targets only apply their own defaults when these are empty, and MSBuild reads env as
+      # properties, so ours win.
+      - name: Pin WDK .inf tools (stampinf/inf2cat) to the NuGet bin
+        shell: pwsh
+        run: |
+          $root = Get-ChildItem "packages\Microsoft.Windows.WDK.x64.*\c\bin" -Directory -ErrorAction SilentlyContinue |
+                  Get-ChildItem -Directory -ErrorAction SilentlyContinue |
+                  Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $root) { throw "WDK bin root not found under packages\Microsoft.Windows.WDK.x64.*\c\bin" }
+          $x64 = Join-Path $root.FullName 'x64'
+          $x86 = Join-Path $root.FullName 'x86'
+          if (-not (Test-Path (Join-Path $x64 'stampinf.exe'))) { throw "stampinf.exe not at $x64" }
+          foreach ($p in @($x64,$x86)) { if (Test-Path $p) { Add-Content -Path $env:GITHUB_PATH -Value $p } }
+          Add-Content -Path $env:GITHUB_ENV -Value "InfToolPath=$x64\"
+          Add-Content -Path $env:GITHUB_ENV -Value "InfToolArchitecture=Native64Bit"
+          Add-Content -Path $env:GITHUB_ENV -Value "Inf2CatToolPath=$x86\"
+          Write-Output "Pinned InfToolPath=$x64\ ; Inf2CatToolPath=$x86\"
+
       - name: Build VDD (${{ matrix.platform }})
         shell: pwsh
         run: |
