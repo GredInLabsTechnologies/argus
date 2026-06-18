@@ -2146,6 +2146,18 @@ static Microsoft::IndirectDisp::IndirectDeviceContext* GetDeviceContext() {
 	return g_DeviceContext;
 }
 
+// === Benchmark probe (BENCH) ===
+// Wall-clock microseconds via QueryPerformanceCounter. Used to bracket the IddCx hot calls
+// (IddCxMonitorArrival / IddCxMonitorDeparture) so the pure driver-side latency can be read from
+// the log, isolated from OS propagation. Cost is one QPC pair + one log line — behavior-neutral.
+// Grep the driver log for "BENCH" to extract these samples.
+static double QpcNowUs() {
+	LARGE_INTEGER freq, ctr;
+	QueryPerformanceFrequency(&freq);
+	QueryPerformanceCounter(&ctr);
+	return static_cast<double>(ctr.QuadPart) * 1e6 / static_cast<double>(freq.QuadPart);
+}
+
 // Reset the watchdog countdown IF it is already armed. Called on every inbound command (ADD,
 // REMOVE, SETDISPLAYCOUNT, PING). This does NOT arm the watchdog — a consumer must opt in by
 // PINGing at least once (see WatchdogArm). Resetting a disarmed watchdog is a no-op so a non-
@@ -4468,7 +4480,14 @@ IDDCX_MONITOR IndirectDeviceContext::CreateMonitorObject(UINT index)
 
 	// Tell the OS that the monitor has been plugged in
 	IDARG_OUT_MONITORARRIVAL ArrivalOut;
+	double _benchArrT0 = QpcNowUs();
 	Status = IddCxMonitorArrival(MonitorCreateOut.MonitorObject, &ArrivalOut);
+	double _benchArrT1 = QpcNowUs();
+	{
+		stringstream bss;
+		bss << "BENCH IddCxMonitorArrival idx=" << index << " us=" << static_cast<long long>(_benchArrT1 - _benchArrT0) << " status=" << Status;
+		vddlog("i", bss.str().c_str());
+	}
 	if (NT_SUCCESS(Status))
 	{
 		vddlog("d", "Monitor arrival successfully reported.");
@@ -4578,7 +4597,14 @@ bool IndirectDeviceContext::RemoveMonitor(UINT index)
 	}
 
 	// Depart with NO lock held (see lock-discipline note above).
+	double _benchDepT0 = QpcNowUs();
 	IddCxMonitorDeparture(handle);
+	double _benchDepT1 = QpcNowUs();
+	{
+		stringstream bss;
+		bss << "BENCH IddCxMonitorDeparture idx=" << index << " us=" << static_cast<long long>(_benchDepT1 - _benchDepT0);
+		vddlog("i", bss.str().c_str());
+	}
 
 	// Purge per-monitor side tables keyed by the (now departed) handle so they don't leak.
 	{
