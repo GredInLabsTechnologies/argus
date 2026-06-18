@@ -36,6 +36,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Put msbuild on PATH (the vs2026 runner ships it, but not on the PowerShell PATH by default).
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
       # Provision the WDK + SDK (IddCx.h, libs, the WindowsUserModeDriver10.0 toolset) via NuGet —
       # the exact packages.config Microsoft restores for Windows-driver-samples. The restored
       # packages are picked up by Directory.Build.props at the repo root (conditional imports, so a
