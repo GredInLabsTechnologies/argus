@@ -1,0 +1,25 @@
+<Project>
+  <!--
+    CI-only relaxations, active ONLY when building against the WDK NuGet package (WDKContentRoot
+    is set). A local EWDK build leaves WDKContentRoot empty and is completely unaffected.
+
+    The CI job validates that the driver COMPILES, not that it passes WHQL-grade static analysis or
+    INF verification. Those two checks rely on the WDK's x86 plug-ins (WindowsPrefast.dll /
+    InfVerif.dll), which fail to load on the hosted runner (C1250 / "Unable to load DLL"). They are
+    not needed to prove the code builds, so we switch them off for the NuGet build only.
+  -->
+
+  <!-- Disable PREfast (/analyze): the .vcxproj forces EnablePREfast=true; override it last so it wins. -->
+  <PropertyGroup Condition="'$(WDKContentRoot)' != ''">
+    <RunCodeAnalysis>false</RunCodeAnalysis>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(WDKContentRoot)' != ''">
+    <ClCompile>
+      <EnablePREfast>false</EnablePREfast>
+    </ClCompile>
+  </ItemDefinitionGroup>
+
+  <!-- Skip INF verification: the WDK's InfVerif target keys off '@(Inf)' (not a property), so this
+       no-op override replaces it for the NuGet build. -->
+  <Target Name="InfVerif" Condition="'$(WDKContentRoot)' != ''" />
+</Project>
