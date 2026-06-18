@@ -52,14 +52,17 @@ jobs:
       - name: Add WDK build tools to PATH
         shell: pwsh
         run: |
-          # Locate stampinf.exe wherever the WDK NuGet package places it (its content lives under
-          # a 'c\' subfolder; layout varies by version), and add that folder to PATH. inf2cat/makecat
-          # live alongside it.
-          $tool = Get-ChildItem "packages\Microsoft.Windows.WDK.x64.*" -Recurse -Filter "stampinf.exe" -File -ErrorAction SilentlyContinue |
-                  Sort-Object FullName -Descending | Select-Object -First 1
-          if (-not $tool) { throw "stampinf.exe not found anywhere under packages\Microsoft.Windows.WDK.x64.*" }
-          Write-Output "WDK tools bin: $($tool.DirectoryName)"
-          Add-Content -Path $env:GITHUB_PATH -Value $tool.DirectoryName
+          # WDK build tools live under <pkg>\c\bin\<ver>\{x64,x86,arm64}\ (stampinf in x64, Inf2Cat in
+          # x86, drvcat in x64/arm64). Add all three so every step of the .inf/.cat pipeline resolves.
+          $root = Get-ChildItem "packages\Microsoft.Windows.WDK.x64.*\c\bin" -Directory -ErrorAction SilentlyContinue |
+                  Get-ChildItem -Directory -ErrorAction SilentlyContinue |
+                  Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $root) { throw "WDK bin root not found under packages\Microsoft.Windows.WDK.x64.*\c\bin" }
+          foreach ($arch in @('x64','x86','arm64')) {
+            $p = Join-Path $root.FullName $arch
+            if (Test-Path $p) { Add-Content -Path $env:GITHUB_PATH -Value $p; Write-Output "PATH += $p" }
+          }
+          if (-not (Test-Path (Join-Path $root.FullName 'x64\stampinf.exe'))) { throw "stampinf.exe not at $($root.FullName)\x64" }
 
       - name: Build VDD (${{ matrix.platform }})
         shell: pwsh
