@@ -2,7 +2,7 @@
 
 # Argus
 
-### A Windows virtual display that appears and disappears on demand — in milliseconds, with no adapter reload.
+### A Windows virtual display that appears and disappears on demand — one live API call, no adapter reload.
 
 **An open-source Indirect Display Driver (IddCx) by [Gred In Labs Technologies](https://github.com/GredInLabsTechnologies)**
 
@@ -36,14 +36,38 @@ Argus rebuilds the lifecycle around a **spacedesk-style on-demand model**:
 
 - **Idle at zero.** The adapter is always present but starts with **0 monitors**. It costs nothing and
   clutters nothing until something actually asks for a screen.
-- **Add / remove one monitor by index, live.** A controller asks for a monitor and one **arrives in
-  milliseconds** via `IddCxMonitorArrival`; it asks to release it and it **departs** via
+- **Add / remove one monitor by index, live.** A controller asks for a monitor and one **arrives live**
+  via a single `IddCxMonitorArrival` call; it asks to release it and it **departs** via
   `IddCxMonitorDeparture` — **with no adapter reload**, no flicker on your other displays, no
   re-enumeration storm.
 - **Self-healing.** A tiny control protocol (`ADD` → index, `REMOVE <index>` → ok, `PING` → pong) drives
   it. If the controller crashes and stops pinging, a watchdog auto-retires the orphaned monitors so you
   never end up with ghost screens — yet a standalone install with no controller keeps its monitors
   forever. Opt-in robustness, no surprises.
+
+### The control loop
+
+A SYSTEM-only named pipe (`\\.\pipe\ArgusDisplay`, SDDL locked to SYSTEM + Administrators) carries the
+whole protocol. The adapter sits at zero monitors until something asks:
+
+```mermaid
+sequenceDiagram
+    participant C as Controller (SYSTEM broker)
+    participant A as Argus (IddCx driver)
+    participant W as Windows
+
+    Note over A: idle at 0 — adapter present, no monitors
+    C->>A: ADD
+    A->>W: IddCxMonitorArrival(index)
+    A-->>C: index
+    Note over A,W: monitor is live — no adapter reload
+    C->>A: PING
+    Note over A: the first PING arms the watchdog<br/>(opt-in self-heal)
+    C->>A: REMOVE index
+    A->>W: IddCxMonitorDeparture(index)
+    A-->>C: OK
+    Note over C,A: …or if PINGs stop, the watchdog<br/>retires every monitor — no ghost screens
+```
 
 ## The hard part (the part we're proud of)
 
@@ -53,6 +77,20 @@ about it. Argus calls `IddCxMonitorDeparture` **outside** the monitors lock and 
 **acyclic lock order** (`device → monitors`, departure outside the lock), documented right in the code.
 The result is add/remove that's instant *and* free of the self-deadlock this API invites. The control
 pipe is also hardened (SDDL restricted to SYSTEM + Administrators, not "Everyone").
+
+```mermaid
+flowchart TD
+    cmd["ADD / REMOVE / watchdog tick"] --> dev["acquire g_DeviceContextMutex"]
+    dev --> mon["acquire m_MonitorsMutex<br/>(mutate the monitor table)"]
+    mon --> rel["release m_MonitorsMutex"]
+    rel --> dep["IddCxMonitorDeparture()<br/><b>outside</b> the monitors lock"]
+    teardown["IddCx teardown<br/>(UnassignSwapChain)"] -.->|"also needs m_MonitorsMutex"| mon
+    dep -.->|"lock already released ⇒ no cycle"| teardown
+```
+
+The order is strictly **`g_DeviceContextMutex → m_MonitorsMutex`**, and `IddCxMonitorDeparture` is the
+one call deliberately made *after* releasing the monitors lock — because the framework's own teardown
+(`UnassignSwapChain`) reaches back for that same lock. Release first, then depart: no cycle, no hang.
 
 This is the kind of detail that doesn't show up in a screenshot but is the difference between a demo and
 something you'd actually run.
