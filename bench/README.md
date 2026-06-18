@@ -50,10 +50,12 @@ Results land in `bench\results\argus-bench-<timestamp>.json` (+ `.csv` for the t
 
 ### Extracting the internal (driver-side) probes
 
-The driver logs one `BENCH IddCxMonitorArrival idx=… us=…` / `BENCH IddCxMonitorDeparture …` line per
-operation. Pull them from the driver log (`vddlog` output) to get pure arrival/departure latency,
-independent of pipe + OS-propagation overhead. These appear only in a build that includes the probes
-(this branch onward).
+The probes are **compiled out of release builds**. Build the driver with `-DARGUS_BENCH` (MSBuild:
+`/p:DefineConstants=ARGUS_BENCH` or add `ARGUS_BENCH` to the project's preprocessor definitions) to
+include them. Such a build logs one `BENCH IddCxMonitorArrival idx=… us=…` /
+`BENCH IddCxMonitorDeparture …` line per operation; pull them from the driver log (`vddlog` output)
+to get pure arrival/departure latency, independent of pipe + OS-propagation overhead. **Production /
+release binaries ship without any benchmark instrumentation.**
 
 ## Honesty notes / limitations
 

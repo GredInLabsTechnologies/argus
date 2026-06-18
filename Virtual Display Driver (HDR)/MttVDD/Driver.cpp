@@ -2146,17 +2146,19 @@ static Microsoft::IndirectDisp::IndirectDeviceContext* GetDeviceContext() {
 	return g_DeviceContext;
 }
 
-// === Benchmark probe (BENCH) ===
+#ifdef ARGUS_BENCH
+// === Benchmark probe (BENCH) — compiled ONLY in benchmark builds (-DARGUS_BENCH) ===
 // Wall-clock microseconds via QueryPerformanceCounter. Used to bracket the IddCx hot calls
 // (IddCxMonitorArrival / IddCxMonitorDeparture) so the pure driver-side latency can be read from
-// the log, isolated from OS propagation. Cost is one QPC pair + one log line — behavior-neutral.
-// Grep the driver log for "BENCH" to extract these samples.
+// the log, isolated from OS propagation. Cost is one QPC pair + one log line. NOT in release
+// builds: production binaries ship without any benchmark instrumentation. See bench/README.md.
 static double QpcNowUs() {
 	LARGE_INTEGER freq, ctr;
 	QueryPerformanceFrequency(&freq);
 	QueryPerformanceCounter(&ctr);
 	return static_cast<double>(ctr.QuadPart) * 1e6 / static_cast<double>(freq.QuadPart);
 }
+#endif
 
 // Reset the watchdog countdown IF it is already armed. Called on every inbound command (ADD,
 // REMOVE, SETDISPLAYCOUNT, PING). This does NOT arm the watchdog — a consumer must opt in by
@@ -4480,14 +4482,18 @@ IDDCX_MONITOR IndirectDeviceContext::CreateMonitorObject(UINT index)
 
 	// Tell the OS that the monitor has been plugged in
 	IDARG_OUT_MONITORARRIVAL ArrivalOut;
+#ifdef ARGUS_BENCH
 	double _benchArrT0 = QpcNowUs();
+#endif
 	Status = IddCxMonitorArrival(MonitorCreateOut.MonitorObject, &ArrivalOut);
+#ifdef ARGUS_BENCH
 	double _benchArrT1 = QpcNowUs();
 	{
 		stringstream bss;
 		bss << "BENCH IddCxMonitorArrival idx=" << index << " us=" << static_cast<long long>(_benchArrT1 - _benchArrT0) << " status=" << Status;
 		vddlog("i", bss.str().c_str());
 	}
+#endif
 	if (NT_SUCCESS(Status))
 	{
 		vddlog("d", "Monitor arrival successfully reported.");
@@ -4597,14 +4603,18 @@ bool IndirectDeviceContext::RemoveMonitor(UINT index)
 	}
 
 	// Depart with NO lock held (see lock-discipline note above).
+#ifdef ARGUS_BENCH
 	double _benchDepT0 = QpcNowUs();
+#endif
 	IddCxMonitorDeparture(handle);
+#ifdef ARGUS_BENCH
 	double _benchDepT1 = QpcNowUs();
 	{
 		stringstream bss;
 		bss << "BENCH IddCxMonitorDeparture idx=" << index << " us=" << static_cast<long long>(_benchDepT1 - _benchDepT0);
 		vddlog("i", bss.str().c_str());
 	}
+#endif
 
 	// Purge per-monitor side tables keyed by the (now departed) handle so they don't leak.
 	{
