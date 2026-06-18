@@ -22,7 +22,11 @@
     </ClCompile>
   </ItemDefinitionGroup>
 
-  <!-- Skip INF verification: the WDK's InfVerif target keys off '@(Inf)' (not a property), so this
-       no-op override replaces it for the NuGet build. -->
-  <Target Name="InfVerif" Condition="'$(WDKContentRoot)' != ''" />
+  <!-- Skip INF verification: the WDK's InfVerif target keys off '@(Inf)' (not a property), so we
+       replace it with a no-op for the NuGet build. CRITICAL: keep the original target's
+       AfterTargets="StampInf" BeforeTargets="PreBuildEvent" hooks — StampInf attaches via
+       BeforeTargets="InfVerif" to generate the stamped .inf, so dropping the hooks would stop the
+       .inf from being produced (MSB3030 "could not copy MttVDD.inf"). -->
+  <Target Name="InfVerif" Condition="'$(WDKContentRoot)' != ''"
+          AfterTargets="StampInf" BeforeTargets="PreBuildEvent" />
 </Project>
