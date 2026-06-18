@@ -76,20 +76,11 @@ jobs:
           $sln = "${{ env.VDD_SOLUTION }}"
           if (-not (Test-Path $sln)) { throw "VDD solution file not found at: $sln" }
 
-          # Minimal property set — same as Microsoft's Build-Samples.ps1. On the vs2026 runner the
-          # WDK NuGet package resolves the toolset, headers, UMDF/WDF and tool architectures itself.
           # INF/API validation are off: this job validates that the driver compiles, not WHQL specs.
-          # DIAGNOSTIC: dump the effective UMDF/WDF resolution so we can see exactly which WDF the
-          # build selects (the IddCx 1.10 build was linking against WDF 2.15, which lacks symbols it
-          # needs). -getProperty evaluates without building. Non-fatal.
-          Write-Output "===== UMDF/WDF property diagnostic (x64) ====="
-          try {
-            msbuild $sln -t:Build -p:Configuration="${{ env.BUILD_CONFIGURATION }}" -p:Platform=x64 `
-              -getProperty:UMDF_VERSION_MAJOR -getProperty:UMDF_VERSION_MINOR `
-              -getProperty:UMDF_VER_PATH -getProperty:UMDF_INC_PATH -getProperty:IncludePath 2>&1 | Out-String | Write-Output
-          } catch { Write-Output "diagnostic failed: $_" }
-          Write-Output "===== end diagnostic ====="
-
+          # UMDF_VERSION_MINOR=25 as a global property keeps the project's per-config value applied.
+          # The WDF headers are routed by the .vcxproj's AdditionalIncludeDirectories, which now lists
+          # $(WDKContentRoot)\Include\wdf\umdf\2.25 (where the NuGet WDK actually ships them) ahead of
+          # the vendored 2.15 fallback, so IddCx 1.10 gets the WDF 2.25 it needs.
           msbuild $sln `
             /m `
             /t:Build `
