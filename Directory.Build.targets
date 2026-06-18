@@ -9,9 +9,12 @@
     not needed to prove the code builds, so we switch them off for the NuGet build only.
   -->
 
-  <!-- Disable PREfast (/analyze): the .vcxproj forces EnablePREfast=true; override it last so it wins. -->
+  <!-- Disable PREfast (/analyze) and ApiValidator: both are WHQL-grade checks whose WDK x86
+       plug-ins (WindowsPrefast.dll / ApiValidator.exe) fail to load on the hosted runner. PREfast
+       is gated by RunCodeAnalysis/EnablePREfast; ApiValidator by ApiValidator_Enable. -->
   <PropertyGroup Condition="'$(WDKContentRoot)' != ''">
     <RunCodeAnalysis>false</RunCodeAnalysis>
+    <ApiValidator_Enable>false</ApiValidator_Enable>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(WDKContentRoot)' != ''">
     <ClCompile>
