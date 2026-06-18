@@ -13,7 +13,6 @@ on:
 
 env:
   BUILD_CONFIGURATION: Release
-  VDD_DIR: Virtual Display Driver (HDR)
   VDD_SOLUTION: Virtual Display Driver (HDR)/MttVDD.sln
 
 permissions:
@@ -34,53 +33,92 @@ jobs:
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
 
-      - name: Setup NuGet
-        uses: NuGet/setup-nuget@v2
-
-      # Provision the WDK + SDK headers (IddCx.h) and the WindowsUserModeDriver10.0 toolset via NuGet.
-      # This is how Microsoft's own Windows-driver-samples build on GitHub Actions runners, which ship
-      # an SDK but not a matching WDK. The restored packages are picked up by Directory.Build.props in
-      # the project directory (conditional imports — local EWDK builds are unaffected).
-      # Restore under the repo ROOT (no parentheses): the WDK MSBuild task assembly fails to load
-      # from a path containing '(' — see Directory.Build.props.
-      - name: Restore WDK/SDK NuGet packages (IddCx.h + driver toolset)
-        shell: pwsh
-        run: nuget restore packages.config -PackagesDirectory packages
-
-      # The NuGet WDK ships build tools (stampinf.exe in x64, Inf2Cat.exe in x86) under
-      # <pkg>\c\bin\<ver>\{x64,x86,arm64}\, but the WDK's own auto-resolution mis-picks the ARM64
-      # stampinf on this x64 runner (FileTracker 0xd8 = EXE machine-type mismatch). Pin the tool
-      # paths/arch explicitly via env vars — MSBuild reads env as properties, and the WDK targets
-      # only set their defaults when these are empty (Condition="'$(InfToolPath)' == ''"), so ours win.
-      - name: Pin WDK build tools (stampinf/inf2cat) to the x64 host
+      - name: Install Windows Driver Kit (IddCx headers)
         shell: pwsh
         run: |
-          $root = Get-ChildItem "packages\Microsoft.Windows.WDK.x64.*\c\bin" -Directory -ErrorAction SilentlyContinue |
-                  Get-ChildItem -Directory -ErrorAction SilentlyContinue |
-                  Sort-Object Name -Descending | Select-Object -First 1
-          if (-not $root) { throw "WDK bin root not found under packages\Microsoft.Windows.WDK.x64.*\c\bin" }
-          $x64 = Join-Path $root.FullName 'x64'
-          $x86 = Join-Path $root.FullName 'x86'
-          if (-not (Test-Path (Join-Path $x64 'stampinf.exe'))) { throw "stampinf.exe not at $x64" }
-          foreach ($p in @($x64,$x86)) { if (Test-Path $p) { Add-Content -Path $env:GITHUB_PATH -Value $p } }
-          # stampinf.exe lives in x64 (run as 64-bit host tool); Inf2Cat.exe lives in x86.
-          Add-Content -Path $env:GITHUB_ENV -Value "InfToolPath=$x64\"
-          Add-Content -Path $env:GITHUB_ENV -Value "InfToolArchitecture=Native64Bit"
-          Add-Content -Path $env:GITHUB_ENV -Value "Inf2CatToolPath=$x86\"
-          Write-Output "Pinned InfToolPath=$x64\ ; Inf2CatToolPath=$x86\"
+          $ErrorActionPreference = "Stop"
+          choco install windowsdriverkit11 -y --no-progress
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Detect Windows SDK (windows.h)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $kitsRoot = $null
+          try {
+            $kitsRoot = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots" -Name "KitsRoot10" -ErrorAction Stop).KitsRoot10
+          } catch {
+            $kitsRoot = Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\"
+          }
+
+          if (-not $kitsRoot -or -not (Test-Path $kitsRoot)) {
+            throw "Windows Kits root not found: $kitsRoot"
+          }
+
+          $includeRoot = Join-Path $kitsRoot "Include"
+          if (-not (Test-Path $includeRoot)) {
+            throw "Windows Kits Include directory not found: $includeRoot"
+          }
+
+          $best =
+            Get-ChildItem -Path $includeRoot -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
+            Where-Object { Test-Path (Join-Path $_.FullName "um\Windows.h") } |
+            Sort-Object -Property Name -Descending |
+            Select-Object -First 1
+
+          if (-not $best) {
+            throw "Could not find an SDK version directory containing um\\Windows.h under: $includeRoot"
+          }
+
+          $sdkVersion = $best.Name
+          Write-Output "Using WindowsSdkDir: $kitsRoot"
+          Write-Output "Using WindowsTargetPlatformVersion: $sdkVersion"
+          "WINDOWS_SDK_DIR=$kitsRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "WINDOWS_TARGET_PLATFORM_VERSION=$sdkVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Build VDD (${{ matrix.platform }})
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+
           $sln = "${{ env.VDD_SOLUTION }}"
           if (-not (Test-Path $sln)) { throw "VDD solution file not found at: $sln" }
+
+          # Pick an available UMDF WDF header version on the runner. Kits can be laid out either
+          # versioned (Include\<sdk>\wdf\umdf\2.xx) or unversioned (Include\wdf\umdf\2.xx). Passing
+          # the detected UMDF_VERSION_MINOR to msbuild keeps the WDF headers in sync with IddCx and
+          # avoids the WdfFunctions_* / PFN_WDFDRIVERERRORREPORTAPIMISSING version-skew errors.
+          $umdfRoots = @(
+            (Join-Path $env:WINDOWS_SDK_DIR ("Include\" + $env:WINDOWS_TARGET_PLATFORM_VERSION + "\wdf\umdf")),
+            (Join-Path $env:WINDOWS_SDK_DIR "Include\wdf\umdf")
+          ) | Where-Object { Test-Path $_ }
+
+          if (-not $umdfRoots -or $umdfRoots.Count -eq 0) {
+            throw "UMDF WDF include root not found under $env:WINDOWS_SDK_DIR (tried versioned + unversioned layouts)"
+          }
+
+          $umdfBest =
+            $umdfRoots |
+            ForEach-Object { Get-ChildItem -Path $_ -Directory -ErrorAction SilentlyContinue } |
+            Where-Object { $_.Name -match '^\d+\.\d+$' } |
+            Sort-Object -Property Name -Descending |
+            Select-Object -First 1
+
+          if (-not $umdfBest) { throw "No UMDF version directories found under: $($umdfRoots -join ', ')" }
+
+          $umdfMinor = ($umdfBest.Name -split '\.')[1]
+          Write-Output "Using UMDF version: $($umdfBest.Name) (minor=$umdfMinor) from $($umdfBest.FullName)"
 
           msbuild $sln `
             /m `
             /t:Build `
             /p:Configuration="${{ env.BUILD_CONFIGURATION }}" `
             /p:Platform="${{ matrix.platform }}" `
+            /p:WindowsSdkDir="$env:WINDOWS_SDK_DIR" `
+            /p:WindowsTargetPlatformVersion="$env:WINDOWS_TARGET_PLATFORM_VERSION" `
+            /p:UMDF_VERSION_MINOR="$umdfMinor" `
             /p:EnableInfVerif=false `
             /p:RunApiValidator=false `
             /verbosity:minimal
@@ -89,7 +127,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $outDir = "${{ env.VDD_DIR }}\${{ matrix.platform }}\${{ env.BUILD_CONFIGURATION }}\MttVDD"
+          $outDir = "Virtual Display Driver (HDR)\${{ matrix.platform }}\${{ env.BUILD_CONFIGURATION }}\MttVDD"
           if (-not (Test-Path $outDir)) { throw "Build output directory not found: $outDir" }
 
           $dest = "artifacts\VDD\${{ matrix.platform }}"
@@ -104,9 +142,9 @@ jobs:
           path: artifacts/VDD/${{ matrix.platform }}/
           if-no-files-found: error
 
-      # ── Firma de producción del driver (SignPath Foundation, OV Authenticode, gratis para OSS) ──
-      # Condicional: solo corre cuando el proyecto ya está dado de alta en SignPath y los secrets/vars
-      # existen. Hasta entonces el CI compila sin romperse. Setup en docs/SIGNING.md.
+      # ── Production driver signing (SignPath Foundation, OV Authenticode, free for OSS) ──
+      # Conditional: only runs once the project is enrolled in SignPath and the secrets/vars exist.
+      # Until then CI compiles green without it. Setup in docs/SIGNING.md.
       - name: Sign driver catalog (SignPath)
         if: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
         uses: signpath/github-action-submit-signing-request@v2
