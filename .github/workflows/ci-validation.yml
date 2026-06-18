@@ -79,12 +79,18 @@ jobs:
           # Minimal property set — same as Microsoft's Build-Samples.ps1. On the vs2026 runner the
           # WDK NuGet package resolves the toolset, headers, UMDF/WDF and tool architectures itself.
           # INF/API validation are off: this job validates that the driver compiles, not WHQL specs.
+          # UMDF_VERSION_MINOR=25 must be a GLOBAL (command-line) property: the project sets it in a
+          # PropertyGroup, but Directory.Build.props imports the WDK .props *before* that runs, so the
+          # WDK sees it empty and defaults to UMDF 2.15 — which lacks WdfDriverErrorReportApiMissing*,
+          # a symbol IddCx 1.10 requires (present in WDF 2.25+). Passing it globally fixes the WDF
+          # selection so IddCx 1.10 compiles. (Matches the project's UMDF_MINIMUM_VERSION_REQUIRED=25.)
           msbuild $sln `
             /m `
             /t:Build `
             /p:Configuration="${{ env.BUILD_CONFIGURATION }}" `
             /p:Platform="${{ matrix.platform }}" `
             /p:TargetVersion=Windows10 `
+            /p:UMDF_VERSION_MINOR=25 `
             /p:EnableInfVerif=false `
             /p:RunApiValidator=false `
             /verbosity:minimal
