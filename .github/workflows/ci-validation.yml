@@ -47,6 +47,17 @@ jobs:
         shell: pwsh
         run: nuget restore packages.config -PackagesDirectory packages
 
+      # The NuGet WDK ships build tools (stampinf.exe, inf2cat.exe, …) in its bin folder, but they
+      # aren't on PATH. Add the x64 host-tools bin so the build can find stampinf (error TRK0005).
+      - name: Add WDK build tools to PATH
+        shell: pwsh
+        run: |
+          $bin = Get-ChildItem "packages\Microsoft.Windows.WDK.x64.*\bin\*\x64" -Directory -ErrorAction SilentlyContinue |
+                 Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $bin) { throw "WDK bin (stampinf) not found under packages\Microsoft.Windows.WDK.x64.*\bin\*\x64" }
+          Write-Output "WDK tools bin: $($bin.FullName)"
+          Add-Content -Path $env:GITHUB_PATH -Value $bin.FullName
+
       - name: Build VDD (${{ matrix.platform }})
         shell: pwsh
         run: |
