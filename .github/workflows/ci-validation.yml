@@ -20,7 +20,13 @@ permissions:
 
 jobs:
   build:
-    runs-on: windows-latest
+    # The WDK NuGet package builds driver projects only on a runner that ships the matching Visual
+    # Studio + WDK build integration. windows-2025-vs2026 is the public GitHub-hosted image Microsoft
+    # uses to keep its own Windows-driver-samples CI green ("configured with Visual Studio 2026 off
+    # the box, so most solutions can be built by running msbuild directly using the WDK NuGet
+    # package" — Windows-driver-samples/.github/Build-with-GitHub.md). windows-latest cannot: it
+    # mis-resolves the WDK toolset (wrong stampinf arch, WDF/IddCx version skew).
+    runs-on: windows-2025-vs2026
     strategy:
       fail-fast: false
       matrix:
@@ -30,95 +36,30 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup MSBuild
-        uses: microsoft/setup-msbuild@v2
-
-      - name: Install Windows Driver Kit (IddCx headers)
+      # Provision the WDK + SDK (IddCx.h, libs, the WindowsUserModeDriver10.0 toolset) via NuGet —
+      # the exact packages.config Microsoft restores for Windows-driver-samples. The restored
+      # packages are picked up by Directory.Build.props at the repo root (conditional imports, so a
+      # local EWDK build is unaffected).
+      - name: Restore WDK/SDK NuGet packages
         shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          choco install windowsdriverkit11 -y --no-progress
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Detect Windows SDK (windows.h)
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $kitsRoot = $null
-          try {
-            $kitsRoot = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots" -Name "KitsRoot10" -ErrorAction Stop).KitsRoot10
-          } catch {
-            $kitsRoot = Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\"
-          }
-
-          if (-not $kitsRoot -or -not (Test-Path $kitsRoot)) {
-            throw "Windows Kits root not found: $kitsRoot"
-          }
-
-          $includeRoot = Join-Path $kitsRoot "Include"
-          if (-not (Test-Path $includeRoot)) {
-            throw "Windows Kits Include directory not found: $includeRoot"
-          }
-
-          $best =
-            Get-ChildItem -Path $includeRoot -Directory -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
-            Where-Object { Test-Path (Join-Path $_.FullName "um\Windows.h") } |
-            Sort-Object -Property Name -Descending |
-            Select-Object -First 1
-
-          if (-not $best) {
-            throw "Could not find an SDK version directory containing um\\Windows.h under: $includeRoot"
-          }
-
-          $sdkVersion = $best.Name
-          Write-Output "Using WindowsSdkDir: $kitsRoot"
-          Write-Output "Using WindowsTargetPlatformVersion: $sdkVersion"
-          "WINDOWS_SDK_DIR=$kitsRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "WINDOWS_TARGET_PLATFORM_VERSION=$sdkVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        run: nuget restore packages.config -PackagesDirectory packages
 
       - name: Build VDD (${{ matrix.platform }})
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-
           $sln = "${{ env.VDD_SOLUTION }}"
           if (-not (Test-Path $sln)) { throw "VDD solution file not found at: $sln" }
 
-          # Pick an available UMDF WDF header version on the runner. Kits can be laid out either
-          # versioned (Include\<sdk>\wdf\umdf\2.xx) or unversioned (Include\wdf\umdf\2.xx). Passing
-          # the detected UMDF_VERSION_MINOR to msbuild keeps the WDF headers in sync with IddCx and
-          # avoids the WdfFunctions_* / PFN_WDFDRIVERERRORREPORTAPIMISSING version-skew errors.
-          $umdfRoots = @(
-            (Join-Path $env:WINDOWS_SDK_DIR ("Include\" + $env:WINDOWS_TARGET_PLATFORM_VERSION + "\wdf\umdf")),
-            (Join-Path $env:WINDOWS_SDK_DIR "Include\wdf\umdf")
-          ) | Where-Object { Test-Path $_ }
-
-          if (-not $umdfRoots -or $umdfRoots.Count -eq 0) {
-            throw "UMDF WDF include root not found under $env:WINDOWS_SDK_DIR (tried versioned + unversioned layouts)"
-          }
-
-          $umdfBest =
-            $umdfRoots |
-            ForEach-Object { Get-ChildItem -Path $_ -Directory -ErrorAction SilentlyContinue } |
-            Where-Object { $_.Name -match '^\d+\.\d+$' } |
-            Sort-Object -Property Name -Descending |
-            Select-Object -First 1
-
-          if (-not $umdfBest) { throw "No UMDF version directories found under: $($umdfRoots -join ', ')" }
-
-          $umdfMinor = ($umdfBest.Name -split '\.')[1]
-          Write-Output "Using UMDF version: $($umdfBest.Name) (minor=$umdfMinor) from $($umdfBest.FullName)"
-
+          # Minimal property set — same as Microsoft's Build-Samples.ps1. On the vs2026 runner the
+          # WDK NuGet package resolves the toolset, headers, UMDF/WDF and tool architectures itself.
+          # INF/API validation are off: this job validates that the driver compiles, not WHQL specs.
           msbuild $sln `
             /m `
             /t:Build `
             /p:Configuration="${{ env.BUILD_CONFIGURATION }}" `
             /p:Platform="${{ matrix.platform }}" `
-            /p:WindowsSdkDir="$env:WINDOWS_SDK_DIR" `
-            /p:WindowsTargetPlatformVersion="$env:WINDOWS_TARGET_PLATFORM_VERSION" `
-            /p:UMDF_VERSION_MINOR="$umdfMinor" `
+            /p:TargetVersion=Windows10 `
             /p:EnableInfVerif=false `
             /p:RunApiValidator=false `
             /verbosity:minimal

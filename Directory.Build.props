@@ -1,0 +1,19 @@
+<Project>
+  <!--
+    WDK/SDK provisioning via NuGet — the same mechanism Microsoft uses to build the official
+    Windows-driver-samples (including the IddCx IndirectDisplay sample) on GitHub Actions.
+
+    Lives at the REPO ROOT on purpose: MSBuild resolves these Import paths relative to this file,
+    so `packages\...` points at the root `packages\` folder that `nuget restore` populates. Keeping
+    it at the parenthesis-free root also dodges an assembly-load bug the WDK build task hits when
+    run from the "Virtual Display Driver (HDR)" folder (its '(' URL-encodes to %28).
+
+    Imports are CONDITIONAL on the restored packages existing, so a local EWDK build (no `packages\`
+    folder) is completely unaffected. Versions match Microsoft's Windows-driver-samples CI.
+  -->
+  <Import Project="packages\Microsoft.Windows.WDK.x64.10.0.28000.1839\build\native\Microsoft.Windows.WDK.x64.props" Condition="Exists('packages\Microsoft.Windows.WDK.x64.10.0.28000.1839\build\native\Microsoft.Windows.WDK.x64.props') and '$(Platform)' == 'x64'"/>
+  <Import Project="packages\Microsoft.Windows.WDK.arm64.10.0.28000.1839\build\native\Microsoft.Windows.WDK.arm64.props" Condition="Exists('packages\Microsoft.Windows.WDK.arm64.10.0.28000.1839\build\native\Microsoft.Windows.WDK.arm64.props') and '$(Platform)' == 'ARM64'"/>
+  <Import Project="packages\Microsoft.Windows.SDK.CPP.x64.10.0.28000.1839\build\native\Microsoft.Windows.SDK.cpp.x64.props" Condition="Exists('packages\Microsoft.Windows.SDK.CPP.x64.10.0.28000.1839\build\native\Microsoft.Windows.SDK.cpp.x64.props') and '$(Platform)' == 'x64'"/>
+  <Import Project="packages\Microsoft.Windows.SDK.CPP.arm64.10.0.28000.1839\build\native\Microsoft.Windows.SDK.cpp.arm64.props" Condition="Exists('packages\Microsoft.Windows.SDK.CPP.arm64.10.0.28000.1839\build\native\Microsoft.Windows.SDK.cpp.arm64.props') and '$(Platform)' == 'ARM64'"/>
+  <Import Project="packages\Microsoft.Windows.SDK.CPP.10.0.28000.1839\build\native\Microsoft.Windows.SDK.cpp.props" Condition="Exists('packages\Microsoft.Windows.SDK.CPP.10.0.28000.1839\build\native\Microsoft.Windows.SDK.cpp.props')"/>
+</Project>
