@@ -47,22 +47,27 @@ jobs:
         shell: pwsh
         run: nuget restore packages.config -PackagesDirectory packages
 
-      # The NuGet WDK ships build tools (stampinf.exe, inf2cat.exe, …) in its bin folder, but they
-      # aren't on PATH. Add the x64 host-tools bin so the build can find stampinf (error TRK0005).
-      - name: Add WDK build tools to PATH
+      # The NuGet WDK ships build tools (stampinf.exe in x64, Inf2Cat.exe in x86) under
+      # <pkg>\c\bin\<ver>\{x64,x86,arm64}\, but the WDK's own auto-resolution mis-picks the ARM64
+      # stampinf on this x64 runner (FileTracker 0xd8 = EXE machine-type mismatch). Pin the tool
+      # paths/arch explicitly via env vars — MSBuild reads env as properties, and the WDK targets
+      # only set their defaults when these are empty (Condition="'$(InfToolPath)' == ''"), so ours win.
+      - name: Pin WDK build tools (stampinf/inf2cat) to the x64 host
         shell: pwsh
         run: |
-          # WDK build tools live under <pkg>\c\bin\<ver>\{x64,x86,arm64}\ (stampinf in x64, Inf2Cat in
-          # x86, drvcat in x64/arm64). Add all three so every step of the .inf/.cat pipeline resolves.
           $root = Get-ChildItem "packages\Microsoft.Windows.WDK.x64.*\c\bin" -Directory -ErrorAction SilentlyContinue |
                   Get-ChildItem -Directory -ErrorAction SilentlyContinue |
                   Sort-Object Name -Descending | Select-Object -First 1
           if (-not $root) { throw "WDK bin root not found under packages\Microsoft.Windows.WDK.x64.*\c\bin" }
-          foreach ($arch in @('x64','x86','arm64')) {
-            $p = Join-Path $root.FullName $arch
-            if (Test-Path $p) { Add-Content -Path $env:GITHUB_PATH -Value $p; Write-Output "PATH += $p" }
-          }
-          if (-not (Test-Path (Join-Path $root.FullName 'x64\stampinf.exe'))) { throw "stampinf.exe not at $($root.FullName)\x64" }
+          $x64 = Join-Path $root.FullName 'x64'
+          $x86 = Join-Path $root.FullName 'x86'
+          if (-not (Test-Path (Join-Path $x64 'stampinf.exe'))) { throw "stampinf.exe not at $x64" }
+          foreach ($p in @($x64,$x86)) { if (Test-Path $p) { Add-Content -Path $env:GITHUB_PATH -Value $p } }
+          # stampinf.exe lives in x64 (run as 64-bit host tool); Inf2Cat.exe lives in x86.
+          Add-Content -Path $env:GITHUB_ENV -Value "InfToolPath=$x64\"
+          Add-Content -Path $env:GITHUB_ENV -Value "InfToolArchitecture=Native64Bit"
+          Add-Content -Path $env:GITHUB_ENV -Value "Inf2CatToolPath=$x86\"
+          Write-Output "Pinned InfToolPath=$x64\ ; Inf2CatToolPath=$x86\"
 
       - name: Build VDD (${{ matrix.platform }})
         shell: pwsh
