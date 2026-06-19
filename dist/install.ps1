@@ -22,13 +22,25 @@ $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 if (-not $admin) { Write-Error "Please run this script elevated (Administrator)."; exit 1 }
 if (-not (Test-Path $inf)) { Write-Error "MttVDD.inf not found next to this script ($here)."; exit 1 }
 
-# Unsigned build → warn if test-signing is off (the driver won't load otherwise).
+# A driver with no TRUSTED signature cannot be installed: Windows rejects unsigned drivers even with
+# test-signing ON (test-signing requires a trusted *test* signature, not the *absence* of one). Detect
+# it up front and explain, instead of letting pnputil fail with a cryptic code (observed: exit 259).
+$cat = Join-Path $here 'mttvdd.cat'
+$sigStatus = if (Test-Path $cat) { (Get-AuthenticodeSignature $cat).Status } else { 'NotSigned' }
+if ($sigStatus -ne 'Valid') {
+    Write-Warning "The driver catalog (mttvdd.cat) has no trusted signature (status: $sigStatus)."
+    Write-Host "  Windows will NOT install an unsigned/untrusted driver, even with test-signing on." -ForegroundColor Yellow
+    Write-Host "  Use a SIGNED Argus release (signed via SignPath), or sign mttvdd.cat with a trusted" -ForegroundColor Yellow
+    Write-Host "  test certificate first. This v0.1.0 pre-release ships unsigned for the signing pipeline." -ForegroundColor Yellow
+    exit 4
+}
+
+# Signed with a TEST cert (not SignPath/OV) -> the driver needs test-signing enabled to load.
 $ts = bcdedit /enum "{current}" 2>$null | Select-String -Pattern 'testsigning\s+Yes'
 if (-not $ts) {
-    Write-Warning "Test-signing is OFF. This is an UNSIGNED build, so the driver will not load."
-    Write-Host   "  Enable it first:  bcdedit /set testsigning on   (then reboot)" -ForegroundColor Yellow
-    Write-Host   "  (Once Argus is signed via SignPath, this step won't be needed on x64.)" -ForegroundColor DarkGray
-    Write-Host   "Registering the driver package anyway so it's ready after you enable test-signing..."
+    Write-Warning "Test-signing is OFF. If this build is test-signed (not SignPath-signed), the driver"
+    Write-Host   "  won't load until you enable it:  bcdedit /set testsigning on   (then reboot)." -ForegroundColor Yellow
+    Write-Host   "  (A SignPath OV-signed release loads without test-signing on x64.)" -ForegroundColor DarkGray
 }
 
 Write-Host "Registering Argus driver: $inf" -ForegroundColor Cyan
