@@ -103,9 +103,14 @@ Visual Studio, or in CI via the public [GitHub Actions workflow](.github/workflo
 
 ## Code signing policy
 
-Release binaries are signed with **Authenticode (OV)** via **SignPath Foundation**, so a signed build
-loads without enabling test-signing on x64. Argus is user-mode (UMDF/IddCx), so it does **not** require
-kernel attestation/EV.
+Release binaries are signed with **Authenticode (OV)** via **SignPath Foundation**. Argus is user-mode
+(UMDF/IddCx), so it does **not** require kernel attestation/EV.
+
+- **x64:** a SignPath-signed build loads with **no test-signing** needed. This is the supported, tested
+  target.
+- **ARM64:** **experimental.** On Windows 11 24H2+, Microsoft enforces stricter driver-signing
+  attestation, so the ARM64 build may still require `bcdedit /set testsigning on`. This is a Windows
+  platform limitation that also affects the upstream driver.
 
 **Current status:** the `v0.1.0` pre-release is **unsigned** — it is the artifact SignPath will sign; an
 installable, signed release follows once SignPath approves. The installer detects an unsigned build and

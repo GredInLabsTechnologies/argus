@@ -280,7 +280,7 @@ try {
             Write-Log -Message "Starting driver installation..."
             $downloadUrl = $null
             if ($DriverVersion -eq "latest") {
-                $apiUrl = "https://api.github.com/repos/VirtualDrivers/Virtual-Display-Driver/releases/latest"
+                $apiUrl = "https://api.github.com/repos/GredInLabsTechnologies/argus/releases/latest"
                 # Technical Choice: Many APIs, including GitHub's, require a User-Agent header.
                 # Omitting this can lead to connection errors (like 403 Forbidden or 404 Not Found).
                 $headers = @{ "User-Agent" = "PowerShell-VDD-Manager-Script" }
@@ -289,14 +289,14 @@ try {
                 $releaseInfo = Invoke-RestMethod -Uri $apiUrl -Headers $headers
                 Write-Verbose "API call successful. Latest release found: $($releaseInfo.tag_name)"
 
-                $asset = $releaseInfo.assets | Where-Object { $_.name -match "x64\.zip$" } | Select-Object -First 1
+                $asset = $releaseInfo.assets | Where-Object { $_.name -match "x64.*\.zip$" } | Select-Object -First 1
                 if (-not $asset) { throw "Could not find a 64-bit driver asset (x64.zip) in the latest GitHub release." }
                 
                 $downloadUrl = $asset.browser_download_url
                 Write-Verbose "Found driver asset: $($asset.name)"
             }
             else {
-                $downloadUrl = "https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/download/$DriverVersion/Signed-Driver-v$DriverVersion-x64.zip"
+                $downloadUrl = "https://github.com/GredInLabsTechnologies/argus/releases/download/$DriverVersion/argus-vdd-x64.zip"
                 Write-Verbose "Using specified driver version: $DriverVersion"
             }
 

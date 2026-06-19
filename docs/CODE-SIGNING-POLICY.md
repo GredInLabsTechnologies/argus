@@ -17,8 +17,11 @@ Applies to the official Argus driver package distributed via the GitHub Releases
   receive, export, or handle the key**.
 - The certificate is issued to **SignPath Foundation** on behalf of the project (standard for the
   Foundation's free OSS program).
-- Argus is a **user-mode** UMDF/IddCx driver, so OV Authenticode is sufficient to load it without
-  test-signing on x64; it does **not** require kernel attestation/EV.
+- Argus is a **user-mode** UMDF/IddCx driver, so OV Authenticode is sufficient to load a signed build
+  without test-signing on **x64**; it does **not** require kernel attestation/EV.
+- **ARM64 is experimental:** on Windows 11 24H2+ Microsoft enforces stricter driver-signing
+  attestation, so the ARM64 build may still require test-signing — a platform limitation shared with
+  the upstream driver.
 
 ## Build provenance
 
@@ -49,10 +52,12 @@ driver with no telemetry, and it makes no network connections of its own.
 
 ## Release & signing flow
 
-1. A release commit is tagged on `master`.
-2. CI builds the driver from source (x64 + ARM64) and uploads the **unsigned** artifact.
-3. After **manual maintainer approval**, SignPath signs the driver catalog (`mttvdd.cat`).
-4. The **signed** artifact is attached to the GitHub Release.
+1. CI builds the driver from source (x64 + ARM64) on every push to `main`/`master` (and on manual
+   dispatch) and uploads the **unsigned** build artifacts.
+2. A maintainer publishes the GitHub Release for the version, attaching those artifacts.
+3. Once SignPath enrollment is active, the CI signing step submits the driver catalog (`mttvdd.cat`) to
+   SignPath; after **manual maintainer approval** in the SignPath portal, the **signed** catalog is
+   produced and attached to the Release.
 
 The CI already contains the SignPath signing steps, gated on the project's SignPath secrets/variables
 (inactive until enrollment). Setup details: [`docs/SIGNING.md`](SIGNING.md).

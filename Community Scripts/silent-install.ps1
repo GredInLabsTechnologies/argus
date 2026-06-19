@@ -7,7 +7,7 @@ param(
     
     # Latest stable version of VDD driver only
     [Parameter(Mandatory=$false)]
-    [string]$DriverURL = "https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/download/25.7.23/VirtualDisplayDriver-x86.Driver.Only.zip"
+    [string]$DriverURL = "https://github.com/GredInLabsTechnologies/argus/releases/download/v0.1.0/argus-vdd-x64.zip"
 );
 
 # Create temp directory
@@ -29,7 +29,7 @@ Expand-Archive -Path $driverZipPath -DestinationPath $tempDir -Force;
 
 # Extract the SignPath certificates
 Write-Host "Extracting SignPath certificates..." -ForegroundColor Cyan;
-$catFile = Join-Path $tempDir 'VirtualDisplayDriver\mttvdd.cat';
+$catFile = Join-Path $tempDir 'mttvdd.cat';
 $catBytes = [System.IO.File]::ReadAllBytes($catFile);
 $certificates = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2Collection;
 $certificates.Import($catBytes);
@@ -49,7 +49,7 @@ foreach ($cert in $certificates) {
 # Install VDD
 Write-Host "Installing Virtual Display Driver silently..." -ForegroundColor Cyan;
 Push-Location $tempDir;
-& $NefConExe install .\VirtualDisplayDriver\MttVDD.inf "Root\MttVDD";
+& $NefConExe install .\MttVDD.inf "Root\MttVDD";
 Start-Sleep -Seconds 10;
 Pop-Location;
 
