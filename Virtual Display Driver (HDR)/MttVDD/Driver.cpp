@@ -423,7 +423,7 @@ bool EnabledQuery(const std::wstring& settingKey) {
 	HKEY hKey;
 	DWORD dwValue;
 	DWORD dwBufferSize = sizeof(dwValue);
-	LONG lResult = RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\MikeTheTech\\VirtualDisplayDriver", 0, KEY_READ, &hKey);
+	LONG lResult = RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\GredInLabs\\Argus", 0, KEY_READ, &hKey);
 
 	if (lResult == ERROR_SUCCESS) {
 		lResult = RegQueryValueExW(hKey, regName.c_str(), NULL, NULL, (LPBYTE)&dwValue, &dwBufferSize);
@@ -518,7 +518,7 @@ int GetIntegerSetting(const std::wstring& settingKey) {
 	HKEY hKey;
 	DWORD dwValue;
 	DWORD dwBufferSize = sizeof(dwValue);
-	LONG lResult = RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\MikeTheTech\\VirtualDisplayDriver", 0, KEY_READ, &hKey);
+	LONG lResult = RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\GredInLabs\\Argus", 0, KEY_READ, &hKey);
 
 	if (lResult == ERROR_SUCCESS) {
 		lResult = RegQueryValueExW(hKey, regName.c_str(), NULL, NULL, (LPBYTE)&dwValue, &dwBufferSize);
@@ -611,7 +611,7 @@ std::wstring GetStringSetting(const std::wstring& settingKey) {
 	DWORD dwBufferSize = MAX_PATH;
 	wchar_t buffer[MAX_PATH];
 
-	LONG lResult = RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\MikeTheTech\\VirtualDisplayDriver", 0, KEY_READ, &hKey);
+	LONG lResult = RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\GredInLabs\\Argus", 0, KEY_READ, &hKey);
 	if (lResult == ERROR_SUCCESS) {
 		lResult = RegQueryValueExW(hKey, regName.c_str(), NULL, NULL, (LPBYTE)buffer, &dwBufferSize);
 		RegCloseKey(hKey);
@@ -685,7 +685,7 @@ double GetDoubleSetting(const std::wstring& settingKey) {
 	DWORD dwBufferSize = MAX_PATH;
 	wchar_t buffer[MAX_PATH];
 
-	LONG lResult = RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\MikeTheTech\\VirtualDisplayDriver", 0, KEY_READ, &hKey);
+	LONG lResult = RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\GredInLabs\\Argus", 0, KEY_READ, &hKey);
 	if (lResult == ERROR_SUCCESS) {
 		lResult = RegQueryValueExW(hKey, regName.c_str(), NULL, NULL, (LPBYTE)buffer, &dwBufferSize);
 		if (lResult == ERROR_SUCCESS) {
@@ -2778,8 +2778,8 @@ bool initpath() {
 	wchar_t szPath[MAX_PATH];
 	DWORD dwBufferSize = sizeof(szPath);
 	LONG lResult;
-	//vddlog("i", "Reading reg: Computer\\HKEY_LOCAL_MACHINE\\SOFTWARE\\MikeTheTech\\VirtualDisplayDriver");           Remove this due to the fact, if reg key exists, this is called before reading
-	lResult = RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\MikeTheTech\\VirtualDisplayDriver", 0, KEY_READ, &hKey);
+	//vddlog("i", "Reading reg: Computer\\HKEY_LOCAL_MACHINE\\SOFTWARE\\GredInLabs\\Argus");           Remove this due to the fact, if reg key exists, this is called before reading
+	lResult = RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\GredInLabs\\Argus", 0, KEY_READ, &hKey);
 	if (lResult != ERROR_SUCCESS) {
 		ostringstream oss;
 		oss << "Failed to open registry key for path. Error code: " << lResult;
@@ -4296,7 +4296,7 @@ void IndirectDeviceContext::InitAdapter()
 
 	// Declare your device strings for telemetry (required)
 	AdapterCaps.EndPointDiagnostics.pEndPointFriendlyName = L"VirtualDisplayDriver Device";
-	AdapterCaps.EndPointDiagnostics.pEndPointManufacturerName = L"MikeTheTech";
+	AdapterCaps.EndPointDiagnostics.pEndPointManufacturerName = L"Gred In Labs Technologies";
 	AdapterCaps.EndPointDiagnostics.pEndPointModelName = L"VirtualDisplayDriver Model";
 
 	// Declare your hardware and firmware versions (required)

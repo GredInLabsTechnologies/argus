@@ -101,11 +101,23 @@ Argus is a user-mode UMDF/IddCx driver. It builds with the **Enterprise WDK (EWD
 Visual Studio, or in CI via the public [GitHub Actions workflow](.github/workflows/ci-validation.yml)
 (reproducible from source). Build notes live in [`docs/`](docs/).
 
-## Signing
+## Code signing policy
 
-Releases are signed with **Authenticode (OV)** so the driver loads without enabling test-signing.
-Argus is user-mode, so it does **not** require kernel attestation/EV. See
-[`docs/SIGNING.md`](docs/SIGNING.md) for the full policy and verification steps.
+Release binaries are signed with **Authenticode (OV)** via **SignPath Foundation**, so a signed build
+loads without enabling test-signing on x64. Argus is user-mode (UMDF/IddCx), so it does **not** require
+kernel attestation/EV.
+
+**Current status:** the `v0.1.0` pre-release is **unsigned** — it is the artifact SignPath will sign; an
+installable, signed release follows once SignPath approves. The installer detects an unsigned build and
+explains, rather than failing cryptically.
+
+- **Roles.** The committers, reviewers and approvers for this project are the **Gred In Labs
+  Technologies** maintainers. Every signing request requires explicit manual maintainer approval —
+  there is no automatic/unattended signing.
+- **Privacy.** Argus does **not** collect, transmit, or process any personal data.
+
+Full policy and verification steps: [`docs/CODE-SIGNING-POLICY.md`](docs/CODE-SIGNING-POLICY.md) and
+[`docs/SIGNING.md`](docs/SIGNING.md).
 
 ## Credits & attribution
 

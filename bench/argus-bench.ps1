@@ -35,11 +35,13 @@ param(
     [int]$Warmup = 20,
     [string]$OutDir = (Join-Path $PSScriptRoot 'results'),
     [switch]$SkipWatchdog,
-    [int]$SettleMs = 5000
+    [int]$SettleMs = 5000,
+    # Control pipe name. Current builds use 'ArgusDisplay'; the legacy/deployed binary uses
+    # 'MTTVirtualDisplayPipe'. The IddCx latency being measured is identical either way.
+    [string]$PipeName = 'ArgusDisplay'
 )
 
 $ErrorActionPreference = 'Stop'
-$PipeName = 'ArgusDisplay'
 
 # ---------------------------------------------------------------------------------------------
 # Preconditions
