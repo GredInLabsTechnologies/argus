@@ -4295,9 +4295,9 @@ void IndirectDeviceContext::InitAdapter()
 	AdapterCaps.EndPointDiagnostics.TransmissionType = IDDCX_TRANSMISSION_TYPE_WIRED_OTHER;
 
 	// Declare your device strings for telemetry (required)
-	AdapterCaps.EndPointDiagnostics.pEndPointFriendlyName = L"VirtualDisplayDriver Device";
+	AdapterCaps.EndPointDiagnostics.pEndPointFriendlyName = L"Argus Virtual Display";
 	AdapterCaps.EndPointDiagnostics.pEndPointManufacturerName = L"Gred In Labs Technologies";
-	AdapterCaps.EndPointDiagnostics.pEndPointModelName = L"VirtualDisplayDriver Model";
+	AdapterCaps.EndPointDiagnostics.pEndPointModelName = L"Argus Virtual Display Model";
 
 	// Declare your hardware and firmware versions (required)
 	IDDCX_ENDPOINT_VERSION Version = {};
