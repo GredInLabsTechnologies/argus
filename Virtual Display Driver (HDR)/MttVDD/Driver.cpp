@@ -149,7 +149,7 @@ vector<tuple<int, int, int, int>> monitorModes;
 vector< DISPLAYCONFIG_VIDEO_SIGNAL_INFO> s_KnownMonitorModes2;
 UINT numVirtualDisplays;
 wstring gpuname;
-wstring confpath = L"C:\\VirtualDisplayDriver";
+wstring confpath = L"C:\\Argus";
 bool logsEnabled = false;
 bool debugLogs = false;
 bool HDRPlus = false;
@@ -3474,7 +3474,7 @@ HRESULT Direct3DDevice::Init()
 #if 0 // Test code
 	{
 		FILE* file;
-		fopen_s(&file, "C:\\VirtualDisplayDriver\\desc_hdr.bin", "wb");
+		fopen_s(&file, "C:\\Argus\\desc_hdr.bin", "wb");
 
 		DXGI_ADAPTER_DESC desc;
 		Adapter->GetDesc(&desc);

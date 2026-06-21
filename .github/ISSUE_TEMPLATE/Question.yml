@@ -6,8 +6,6 @@ title: "[Question]: "
 
 labels: ["question", "triage"]
 
-assignees: ["zjoasan", "bud3699", "itsmikethetech"]
-
 body:
   - type: markdown
     attributes:

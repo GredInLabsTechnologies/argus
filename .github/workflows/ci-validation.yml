@@ -9,6 +9,8 @@ on:
       - '**.md'
       - 'docs/**'
       - 'LICENSE*'
+    tags:
+      - 'v*'
   workflow_dispatch:
 
 env:

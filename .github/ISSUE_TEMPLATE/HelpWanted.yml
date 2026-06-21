@@ -2,7 +2,6 @@ name: Help Request
 description: Request help with an issue.
 title: "[Help]: "
 labels: ["help wanted", "triage"]
-assignees: ["zjoasan", "bud3699", "itsmikethetech"]
 
 body:
   - type: markdown

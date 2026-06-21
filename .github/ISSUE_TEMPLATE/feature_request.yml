@@ -2,7 +2,6 @@ name: Feature Request
 description: Request a new Feature.
 title: "[Feature]: "
 labels: ["remove", "customize", "companion", "enhancement", "newcode"]
-assignees: ["zjoasan", "bud3699", "itsmikethetech"]
 
 body:
   - type: markdown
