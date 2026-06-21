@@ -112,10 +112,10 @@ Release binaries are signed with **Authenticode (OV)** via **SignPath Foundation
   attestation, so the ARM64 build may still require `bcdedit /set testsigning on`. This is a Windows
   platform limitation that also affects the upstream driver.
 
-**Current status:** the `v0.1.0` pre-release is **not production-signed** — its catalog carries only an
-untrusted WDK test signature; it is the artifact SignPath will sign, and an installable, signed release
-follows once SignPath approves. The installer detects the untrusted build and explains, rather than
-failing cryptically.
+**Signing status:** the `v0.1.0` driver is **not production-signed** — its catalog carries only an
+untrusted WDK test signature; that is the artifact SignPath will sign, after which an installable, signed
+release follows once SignPath approves. The release is built from this repo's public CI. The installer
+detects an untrusted build and explains, rather than failing cryptically.
 
 - **Roles.** The committers, reviewers and approvers for this project are the **Gred In Labs
   Technologies** maintainers. Every signing request requires explicit manual maintainer approval —

@@ -105,8 +105,8 @@ jobs:
           New-Item -ItemType Directory -Path $dest -Force | Out-Null
           Copy-Item "$outDir\*" -Destination $dest -Recurse -Force
 
-      - name: Upload artifacts (unsigned)
-        id: upload-unsigned
+      - name: Upload artifacts (not production-signed)
+        id: upload-build
         uses: actions/upload-artifact@v4
         with:
           name: VDD-${{ matrix.platform }}-${{ env.BUILD_CONFIGURATION }}
@@ -127,7 +127,7 @@ jobs:
           signing-policy-slug: >-
             ${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
               && 'release-signing' || 'test-signing' }}
-          github-artifact-id: '${{ steps.upload-unsigned.outputs.artifact-id }}'
+          github-artifact-id: '${{ steps.upload-build.outputs.artifact-id }}'
           wait-for-completion: true
           output-artifact-directory: 'artifacts/VDD/${{ matrix.platform }}-signed'
 

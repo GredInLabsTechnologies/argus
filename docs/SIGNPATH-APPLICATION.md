@@ -52,7 +52,7 @@ Submit at <https://signpath.org/apply> (form, sent by email). Suggested answers:
 5. In GitHub → repo `argus` → Settings → Secrets and variables → Actions:
    - Secret `SIGNPATH_API_TOKEN` = the SignPath CI token.
    - Variable `SIGNPATH_ORGANIZATION_ID` = your SignPath organization GUID.
-6. Push to `master` → CI builds, uploads the unsigned `.cat`, SignPath signs it (per-release approval),
+6. Push to `master` → CI builds, uploads the not-production-signed `.cat`, SignPath signs it (per-release approval),
    and the `VDD-…-SIGNED` artifact appears. The CI signing steps are already wired and inert until these
    secrets exist (see `docs/SIGNING.md`).
 
