@@ -279,6 +279,12 @@
     <PostBuildEvent>
       <Command>copy "$(ProjectDir)..\vdd_settings.xml" "$(TargetDir)\MttVDD"</Command>
     </PostBuildEvent>
+    <Inf>
+      <SpecifyDriverVerDirectiveDate>true</SpecifyDriverVerDirectiveDate>
+      <DateStamp>06/21/2026</DateStamp>
+      <SpecifyDriverVerDirectiveVersion>true</SpecifyDriverVerDirectiveVersion>
+      <TimeStamp>0.1.0.0</TimeStamp>
+    </Inf>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM'">
     <ClCompile>
@@ -325,7 +331,10 @@
       <Command>copy "$(ProjectDir)..\vdd_settings.xml" "$(TargetDir)\MttVDD"</Command>
     </PostBuildEvent>
     <Inf>
-      <DateStamp>10/16/2024</DateStamp>
+      <SpecifyDriverVerDirectiveDate>true</SpecifyDriverVerDirectiveDate>
+      <DateStamp>06/21/2026</DateStamp>
+      <SpecifyDriverVerDirectiveVersion>true</SpecifyDriverVerDirectiveVersion>
+      <TimeStamp>0.1.0.0</TimeStamp>
     </Inf>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'">
@@ -349,7 +358,10 @@
       <Command>copy "$(ProjectDir)..\vdd_settings.xml" "$(TargetDir)\MttVDD"</Command>
     </PostBuildEvent>
     <Inf>
-      <DateStamp>10/16/2024</DateStamp>
+      <SpecifyDriverVerDirectiveDate>true</SpecifyDriverVerDirectiveDate>
+      <DateStamp>06/21/2026</DateStamp>
+      <SpecifyDriverVerDirectiveVersion>true</SpecifyDriverVerDirectiveVersion>
+      <TimeStamp>0.1.0.0</TimeStamp>
     </Inf>
   </ItemDefinitionGroup>
   <ItemGroup>
