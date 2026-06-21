@@ -14,7 +14,7 @@ Anyway here is a short description of each script:
 | [rotate‑VDD.ps1](rotate-VDD.ps1)       | Rotates the virtual display 90°, 180°, or 270° by calling DisplayConfig with the matching rotation token. |
 | [scale‑VDD.ps1](scale-VDD.ps1)        | Sets or resets DPI scaling on the virtual monitor, respecting Windows’ maximum allowed scale factor. |
 | [set‑dependencies.ps1](set-dependencies.ps1) | Verifies the exact module versions required, installs or imports them on demand, and aborts downstream execution if anything is missing. |
-| [silent‑install.ps1](silent-install.ps1)   | Silently fetches the latest signed Virtual Display Driver from GitHub and installs it via Nefcon, then tidies up the temp workspace. |
+| [silent‑install.ps1](silent-install.ps1)   | Silently fetches the latest Argus release from GitHub and installs it via Nefcon, then tidies up the temp workspace. |
 | [toggle‑VDD.ps1](toggle-VDD.ps1)       | A one‑click PowerShell switch that first elevates itself to admin, then enables or disables your Virtual Display Driver and immediately flips Windows between Extended and Cloned desktops, perfect for streamers who need to bring a virtual monitor online or offline on demand. |
 | [virtual-driver-manager.ps1](virtual-driver-manager.ps1) | A comprehensive script to manage the Virtual Display Driver. It can install, uninstall, enable, disable, toggle, and check the status of the driver. |
 | [winp‑VDD.ps1](winp-VDD.ps1)         | A lightweight companion script that leaves the driver untouched and simply yo‑yos Windows between Extend and Clone modes, giving you an instant “presentation toggle” when the virtual display should stay permanently enabled. |

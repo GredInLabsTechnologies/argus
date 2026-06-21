@@ -21,6 +21,18 @@ program, so releases load **without test-signing** on x64. Prepared 2026-06-18.
 | Built from source verifiably | ✅ | Public CI (`.github/workflows/ci-validation.yml`), reproducible. |
 | Per-release manual sign approval | ✅ | Accepted — that's the SignPath model. |
 
+## Fork eligibility (SignPath conditions for a modified upstream project)
+
+argus is a fork of `VirtualDrivers/Virtual-Display-Driver`. SignPath signs a modified upstream project
+only when **all** of the following hold — argus meets each:
+
+| SignPath fork condition | argus | Evidence |
+|---|---|---|
+| The upstream project publishes signed builds | ✅ | `VirtualDrivers/Virtual-Display-Driver` is itself signed via SignPath Foundation. |
+| The project **visibly uses a fork** of the upstream | ✅ | GitHub fork: `GredInLabsTechnologies/argus` → parent `VirtualDrivers/Virtual-Display-Driver` (`isFork=true`, "forked from" banner on the repo page). |
+| Release branches are **based on upstream branches** that are usually signed | ✅ | `master` descends from the upstream's signed `master` (shared git ancestor = current upstream HEAD); the Argus rebrand/hardening commits are layered on top, not an unrelated history. |
+| All other obligations (own the repo, maintain the sources, manual per-release approval) | ✅ | Gred In Labs Technologies owns and maintains the repository; every release is manually approved (see `CODE-SIGNING-POLICY.md`). |
+
 ## Application form — field → value
 
 Submit at <https://signpath.org/apply> (form, sent by email). Suggested answers:
