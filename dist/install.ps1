@@ -6,8 +6,8 @@
   on-demand virtual-display engine behind Istro: after install it sits at 0 monitors until a
   controller asks (or until numVirtualDisplays > 0 in vdd_settings.xml).
 
-  This build is UNSIGNED (SignPath Foundation signing pending) → it loads only with test-signing
-  enabled. Run elevated (Administrator).
+  This build is NOT production-signed (its catalog carries only an untrusted WDK test signature;
+  SignPath Foundation signing pending) → it loads only with test-signing enabled. Run elevated (Administrator).
 #>
 [CmdletBinding()]
 param()
@@ -31,7 +31,7 @@ if ($sigStatus -ne 'Valid') {
     Write-Warning "The driver catalog (mttvdd.cat) has no trusted signature (status: $sigStatus)."
     Write-Host "  Windows will NOT install an unsigned/untrusted driver, even with test-signing on." -ForegroundColor Yellow
     Write-Host "  Use a SIGNED Argus release (signed via SignPath), or sign mttvdd.cat with a trusted" -ForegroundColor Yellow
-    Write-Host "  test certificate first. This v0.1.0 pre-release ships unsigned for the signing pipeline." -ForegroundColor Yellow
+    Write-Host "  test certificate first. This v0.1.0 pre-release ships with only an untrusted test signature." -ForegroundColor Yellow
     exit 4
 }
 

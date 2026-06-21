@@ -53,7 +53,7 @@ driver with no telemetry, and it makes no network connections of its own.
 ## Release & signing flow
 
 1. CI builds the driver from source (x64 + ARM64) on every push to `main`/`master` (and on manual
-   dispatch) and uploads the **unsigned** build artifacts.
+   dispatch) and uploads the build artifacts (**not production-signed** — only an untrusted WDK test signature).
 2. A maintainer publishes the GitHub Release for the version, attaching those artifacts.
 3. Once SignPath enrollment is active, the CI signing step submits the driver catalog (`mttvdd.cat`) to
    SignPath; after **manual maintainer approval** in the SignPath portal, the **signed** catalog is

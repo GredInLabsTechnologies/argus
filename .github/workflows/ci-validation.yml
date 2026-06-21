@@ -16,6 +16,12 @@ on:
 env:
   BUILD_CONFIGURATION: Release
   VDD_SOLUTION: Virtual Display Driver (HDR)/MttVDD.sln
+  # Deterministic, architecture-coherent DriverVer. With DriverVer= blank in the INF and no
+  # Enable VersionStamp/DateStamp, stampinf derives the version from each arch's ntverp.h (so x64 and
+  # ARM64 disagree) and stamps the build date (non-reproducible across the parallel jobs). Forcing
+  # STAMPINF_VERSION/STAMPINF_DATE makes both jobs stamp identical, reproducible values. Bump per release.
+  STAMPINF_VERSION: "0.1.0.0"
+  STAMPINF_DATE: "06/21/2026"
 
 permissions:
   contents: read

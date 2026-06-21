@@ -5,8 +5,8 @@ program, so releases load **without test-signing** on x64. Prepared 2026-06-18.
 
 > **Prerequisite (the real blocker):** SignPath requires the project to *"already be released in the form
 > that should be signed."* argus must therefore have a **published GitHub release** (v0.1.0) with the
-> driver artifact **before** the application is sent. The release can ship the unsigned `.cat`; SignPath
-> signs it afterwards. See "Order of operations" below.
+> driver artifact **before** the application is sent. The release can ship the not-production-signed `.cat`
+> (it carries only an untrusted WDK test signature); SignPath signs it afterwards. See "Order of operations" below.
 
 ## Eligibility checklist (argus vs. SignPath's criteria)
 
@@ -42,8 +42,8 @@ Submit at <https://signpath.org/apply> (form, sent by email). Suggested answers:
 
 ## Order of operations
 
-1. **Publish release v0.1.0** on GitHub (driver `.cat`/`.dll`/`.inf` per arch; unsigned is fine — note in
-   the release that signing via SignPath is pending). This satisfies "already released".
+1. **Publish release v0.1.0** on GitHub (driver `.cat`/`.dll`/`.inf` per arch; a not-production-signed
+   build is fine — note in the release that signing via SignPath is pending). This satisfies "already released".
 2. **Send the application** (form above) referencing the repo + the v0.1.0 release.
 3. **Wait for manual approval** (days).
 4. On approval, in SignPath create: project (slug `argus`), an artifact-configuration that signs
